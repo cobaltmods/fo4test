@@ -100,6 +100,7 @@ public:
 	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
 	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
 	UINT GetFrameIndex() const { return frameIndex; }
+	ID3D12Resource* GetPresentBufferForDiagnostics(UINT a_index) const { return a_index < kDX12FrameCount ? swapChainBuffers[a_index].get() : nullptr; }
 	void WaitForFrameStart();
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
 	bool WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly = false);
@@ -156,6 +157,11 @@ private:
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
 		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
 		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
+		winrt::com_ptr<ID3D12Resource> retainedReShadeDepth;
+		winrt::com_ptr<ID3D12Resource> retainedReShadeSnapshot;
+		// Reused only after this context's fence completes, unlike a global
+		// upload buffer which CPU text updates could overwrite while in flight.
+		winrt::com_ptr<ID3D12Resource> osdUpload;
 		std::shared_ptr<D3D11D3D12SharedTexture> screenshotInput;
 		std::shared_ptr<D3D11D3D12SharedTexture> screenshotOutput;
 		UINT index = 0;
@@ -220,6 +226,7 @@ private:
 	std::array<UINT64, kDX12FrameCount> queuedReuseFenceValues{};
 	std::array<UINT64, kDX12FrameCount> presentSlotFenceValues{};
 	std::array<bool, kDX12FrameCount> inputsUsedAtPresent{};
+	std::array<uint64_t, kDX12FrameCount> reshadeSnapshotFrames{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	HWND hwnd = nullptr;

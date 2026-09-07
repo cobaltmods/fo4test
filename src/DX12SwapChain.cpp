@@ -16,6 +16,7 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
+#include "ReShadeDepth.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
 
 extern bool enbLoaded;
@@ -863,6 +864,7 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	queuedReuseFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
+	reshadeSnapshotFrames.fill(0);
 }
 
 void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
@@ -1185,6 +1187,9 @@ void DX12SwapChain::RecreateInteropTextures()
 
 DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 {
+	if (deviceLost) {
+		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
+	}
 	const auto completedValue = commandFence ? commandFence->GetCompletedValue() : 0;
 	if (completedValue == std::numeric_limits<UINT64>::max()) {
 		deviceLost = true;
@@ -1198,6 +1203,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 			context.index = static_cast<UINT>(contextIndex);
 			context.fenceValue = 0;
 			context.retainedPresentOverride = nullptr;
+			context.retainedReShadeDepth = nullptr;
+			context.retainedReShadeSnapshot = nullptr;
 			context.screenshotInput.reset();
 			context.screenshotOutput.reset();
 			DX::ThrowIfFailed(context.allocator->Reset());
@@ -1223,6 +1230,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	context.index = waitContextIndex;
 	context.fenceValue = 0;
 	context.retainedPresentOverride = nullptr;
+	context.retainedReShadeDepth = nullptr;
+	context.retainedReShadeSnapshot = nullptr;
 	context.screenshotInput.reset();
 	context.screenshotOutput.reset();
 	DX::ThrowIfFailed(context.allocator->Reset());
@@ -1233,11 +1242,18 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 {
 	DX::ThrowIfFailed(a_context.list->Close());
+	// Once submitted, this allocator and its retained resources must never look
+	// idle again unless a successfully signalled fence proves completion.
+	a_context.fenceValue = UINT64_MAX;
 	ID3D12CommandList* lists[] = { a_context.list.get() };
 	commandQueue->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
 
 	const auto signalValue = commandFenceValue++;
-	DX::ThrowIfFailed(commandQueue->Signal(commandFence.get(), signalValue));
+	const auto signalResult = commandQueue->Signal(commandFence.get(), signalValue);
+	if (FAILED(signalResult)) {
+		deviceLost = true;
+		DX::ThrowIfFailed(signalResult);
+	}
 	a_context.fenceValue = signalValue;
 }
 
@@ -1293,11 +1309,15 @@ bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext
 	if (a_context) {
 		a_context->fenceValue = signalValue;
 	}
+	inputsUsedAtPresent[a_frameIndex] = false;
 	return true;
 }
 
 bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 {
+	if (deviceLost || a_value == UINT64_MAX) {
+		return false;
+	}
 	if (!commandFence || a_value == 0) {
 		return true;
 	}
@@ -1323,24 +1343,37 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 		logger::error("[DX12SwapChain] SetEventOnCompletion failed result=0x{:08X} value={}", static_cast<uint32_t>(eventResult), a_value);
 		return false;
 	}
-	const auto waitResult = WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
-	if (waitResult != WAIT_OBJECT_0) {
-		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
-		deviceLost = FAILED(removedReason);
-		logger::error(
-			"[DX12SwapChain] Command fence wait failed waitResult=0x{:08X} value={} completed={} removed=0x{:08X}",
-			waitResult,
-			a_value,
-			commandFence->GetCompletedValue(),
-			static_cast<uint32_t>(removedReason));
-		return false;
+	// A timed-out earlier registration can signal the reused event, and device
+	// removal also wakes fence events. Neither proves this wait's completion.
+	const auto deadline = GetTickCount64() + 5000;
+	for (;;) {
+		const auto now = GetTickCount64();
+		const auto remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0u;
+		const auto waitResult = WaitForSingleObjectEx(commandFenceEvent.get(), remaining, FALSE);
+		const auto completedAfterWait = commandFence->GetCompletedValue();
+		if (completedAfterWait == UINT64_MAX) {
+			deviceLost = true;
+			return false;
+		}
+		if (completedAfterWait >= a_value) {
+			return true;
+		}
+		if (waitResult != WAIT_OBJECT_0 || GetTickCount64() >= deadline) {
+			const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
+			deviceLost = FAILED(removedReason);
+			logger::error(
+				"[DX12SwapChain] Command fence wait failed waitResult=0x{:08X} value={} completed={} removed=0x{:08X}",
+				waitResult, a_value, completedAfterWait, static_cast<uint32_t>(removedReason));
+			return false;
+		}
+		// Consume a stale wakeup, then keep waiting for this request within the
+		// original timeout. Do not register another event or restart the budget.
 	}
-	return true;
 }
 
 bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
 {
-	if (a_frameIndex >= std::size(frameSlotFenceValues)) {
+	if (deviceLost || a_frameIndex >= std::size(frameSlotFenceValues)) {
 		return false;
 	}
 
@@ -1399,6 +1432,7 @@ bool DX12SwapChain::WaitForGPUIdle()
 	queuedReuseFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
+	reshadeSnapshotFrames.fill(0);
 	return true;
 }
 
@@ -1787,14 +1821,17 @@ void main(uint3 p : SV_DispatchThreadID)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	ReShadeDepth::AdvancePresent();
 	// TEST does not consume the staged scene or advance resource retirement.
 	if (Flags & DXGI_PRESENT_TEST) {
 		return swapChain ? swapChain->Present(SyncInterval, Flags) : DXGI_ERROR_INVALID_CALL;
 	}
 	if (deviceLost) {
+		ReShadeDepth::Invalidate();
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
 	if (!IsReady()) {
+		ReShadeDepth::Invalidate();
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
@@ -1810,6 +1847,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
+		ReShadeDepth::Invalidate();
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
 		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
@@ -1855,6 +1893,23 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	const auto presentedFrameIndex = frameIndex;
 	auto destination = swapChainBuffers[presentedFrameIndex].get();
+	// Upscaler evaluation normally already submitted an independent snapshot.
+	// Only standalone/fallback frames need a late copy. Its input reuse is
+	// fenced at submission, never extended to post-Present just for ReShade.
+	auto* reshadeDepth = upscaling->GetCurrentSharedDepth();
+	const auto depthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	const bool copiedReShadeDepth = reshadeSnapshotFrames[presentedFrameIndex] != depthFrame &&
+		ReShadeDepth::Prepare(commandList, reshadeDepth, presentedFrameIndex, commandContext.retainedReShadeSnapshot);
+	if (copiedReShadeDepth) {
+		commandContext.retainedReShadeDepth.copy_from(reshadeDepth);
+	} else {
+		commandContext.retainedReShadeDepth = nullptr;
+	}
+	// Consume the frame stamp even if this Present could not publish depth.
+	// Repeated Presents without world rendering must never recycle old depth.
+	upscaling->dlssDepthCaptureFrames[presentedFrameIndex] = 0;
+	upscaling->fsrDepthCaptureFrames[presentedFrameIndex] = 0;
+	upscaling->reshadeDepthCaptureFrames[presentedFrameIndex] = 0;
 	auto copySource = useSharedNativeUI ? nativeUISharedTexture->resource12.get() : presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
@@ -1937,6 +1992,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			OSD::GetSingleton()->Render(
 				d3d12Device.get(),
 				commandList,
+				commandContext.osdUpload,
 				destination,
 				presentedFrameIndex,
 				swapChainDesc.Format,
@@ -1951,6 +2007,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	ExecuteCommandContext(commandContext);
+	if (copiedReShadeDepth) {
+		inputReuseFenceValues[presentedFrameIndex] = std::max(inputReuseFenceValues[presentedFrameIndex], commandContext.fenceValue);
+		reshadeSnapshotFrames[presentedFrameIndex] = depthFrame;
+		ReShadeDepth::PublishSubmittedDepth();
+	}
 	if (useSharedNativeUI) {
 		// The compositor is the last D3D12 reader of this UI texture. FG receives
 		// the composed swapchain image and separate world/depth/motion resources.
@@ -1965,6 +2026,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		streamline->OnPresentStart();
 	}
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
+	ReShadeDepth::EndPresent();
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
 	}
@@ -2055,6 +2117,24 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	}
 
 	const auto evaluationFrameIndex = frameIndex;
+	nvngx::dlss_nr::D3D12EvaluationParameters nrPreparation{};
+	auto* streamline = Streamline::GetSingleton();
+	if (a_evaluateDLSS && streamline->GetD3D12DLSSNRPreparation(evaluationFrameIndex, nrPreparation)) {
+		// Lifecycle work precedes this frame's input-ready queue wait. Flush
+		// D3D11 explicitly before the exceptional CPU drain, then submit NGX
+		// creation separately from NR/SR evaluation. Normal frames never drain.
+		if (!WaitForInteropIdle()) {
+			return result;
+		}
+		auto& initialization = AcquireCommandContext();
+		const auto prepared = streamline->PrepareD3D12DLSSNR(initialization.list.get(), nrPreparation);
+		// Even an unsuccessful NGX creation may record GPU work. Submit and
+		// fence it rather than resetting/releasing an apparently idle context.
+		ExecuteCommandContext(initialization);
+		logger::info("[DLSS-NR Direct] Preparation submitted ready={} input={}x{} mode={} fence={}",
+			prepared, nrPreparation.inputWidth, nrPreparation.inputHeight,
+			nrPreparation.options.performanceMode, initialization.fenceValue);
+	}
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
@@ -2062,22 +2142,30 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
 
+	// Detach depth while the inputs are owned by this evaluation submission.
+	// ReShade's output queue will only see the detached, completed snapshot.
+	auto* upscaling = Upscaling::GetSingleton();
+	const auto depthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	auto* sharedDepth = upscaling->GetCurrentSharedDepth();
+	const bool copiedReShadeDepth = reshadeSnapshotFrames[evaluationFrameIndex] != depthFrame &&
+		ReShadeDepth::Prepare(commandList, sharedDepth, evaluationFrameIndex, commandContext.retainedReShadeSnapshot, true);
+	if (copiedReShadeDepth) commandContext.retainedReShadeDepth.copy_from(sharedDepth);
+
 	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
 
-	DX::ThrowIfFailed(commandList->Close());
-
-	if (!result.Any()) {
+	if (!result.Any() && !copiedReShadeDepth) {
+		DX::ThrowIfFailed(commandList->Close());
 		return result;
 	}
 
-	ID3D12CommandList* lists[] = { commandList };
-	commandQueue->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
-	const auto signalValue = commandFenceValue++;
-	DX::ThrowIfFailed(commandQueue->Signal(commandFence.get(), signalValue));
-	commandContext.fenceValue = signalValue;
+	ExecuteCommandContext(commandContext);
+	if (copiedReShadeDepth) {
+		reshadeSnapshotFrames[evaluationFrameIndex] = depthFrame;
+		ReShadeDepth::PublishSubmittedDepth();
+	}
+	const auto signalValue = commandContext.fenceValue;
 	frameSlotFenceValues[evaluationFrameIndex] = signalValue;
 	inputReuseFenceValues[evaluationFrameIndex] = signalValue;
-	const auto* upscaling = Upscaling::GetSingleton();
 	inputsUsedAtPresent[evaluationFrameIndex] = upscaling->IsFrameGenerationActive() ||
 		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
 
@@ -2147,7 +2235,9 @@ bool DX12SwapChain::EnsureFidelityFXFrameGenerationSwapChain()
 		return false;
 	}
 
-	WaitForGPUIdle();
+	if (!WaitForGPUIdle()) {
+		return false;
+	}
 
 	originalSwapChain->AddRef();
 	IDXGISwapChain4* wrappedSwapChain = originalSwapChain;

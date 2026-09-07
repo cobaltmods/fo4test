@@ -37,6 +37,8 @@ using PFun_slSetTag2 = sl::Result(const sl::ViewportHandle& viewport, const sl::
 class Streamline
 {
 public:
+	bool GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const;
+	bool PrepareD3D12DLSSNR(ID3D12GraphicsCommandList* a_list, const nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters);
 	// ========================================
 	// Singleton & Lifecycle
 	// ========================================

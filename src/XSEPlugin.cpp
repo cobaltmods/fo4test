@@ -1,6 +1,7 @@
 #include "DX11Hooks.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
+#include "ReShadeDepth.h"
 
 #include "ENB/ENBSeriesAPI.h"
 
@@ -84,9 +85,11 @@ void AddDebugInformation()
 void OnInit(F4SE::MessagingInterface::Message* a_msg)
 {
 	switch (a_msg->type) {
+	case F4SE::MessagingInterface::kPostLoad:
+		UpscalingMenu::Register();
+		break;
 	case F4SE::MessagingInterface::kPostPostLoad:
 		Upscaling::InstallHighFPSPhysicsFixCompatibility();
-		UpscalingMenu::Register();
 		break;
 	case F4SE::MessagingInterface::kGameDataReady:
 	{
@@ -111,6 +114,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 #endif
 
 	InitializeLog();
+	ReShadeDepth::Initialize();
 
 	auto& trampoline = REL::GetTrampoline();
 	trampoline.create(1024);

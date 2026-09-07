@@ -5,6 +5,7 @@
 #include <cstring>
 #include <d3dcompiler.h>
 
+#include "DX12SwapChain.h"
 #include "FidelityFX.h"
 #include "Streamline.h"
 #include "Upscaling.h"
@@ -224,6 +225,11 @@ bool OSD::EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat
 		return true;
 	}
 
+	// OSD mode changes also replace shader-visible descriptors and textures.
+	// No OSD commands for this frame have been recorded yet.
+	if (device && !DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
+		return false;
+	}
 	device.copy_from(a_device);
 	currentBackBufferFormat = a_backBufferFormat;
 	currentWidth = a_width;
@@ -372,14 +378,6 @@ float4 PSMain(PSInput input) : SV_TARGET
 		a_device->GetCopyableFootprints(&textureDesc, 0, 1, 0, &footprint, &rowCount, &rowSize, &uploadSize);
 		uploadRowPitch = footprint.Footprint.RowPitch;
 		auto heapUpload = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-		auto uploadDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadSize);
-		ThrowIfFailed(a_device->CreateCommittedResource(
-			&heapUpload,
-			D3D12_HEAP_FLAG_NONE,
-			&uploadDesc,
-			D3D12_RESOURCE_STATE_GENERIC_READ,
-			nullptr,
-			IID_PPV_ARGS(textureUpload.put())));
 
 		const float left = 12.0f;
 		const float top = 12.0f;
@@ -586,23 +584,35 @@ std::string OSD::BuildDetailedText() const
 	return text;
 }
 
-void OSD::UpdateTexture(ID3D12GraphicsCommandList* a_commandList)
+void OSD::UpdateTexture(ID3D12GraphicsCommandList* a_commandList, winrt::com_ptr<ID3D12Resource>& a_upload)
 {
-	if (!textureDirty || !texture || !textureUpload || !a_commandList) {
+	if (!textureDirty || !texture || !a_commandList) {
 		return;
+	}
+	// The caller owns this allocation in a completed command-context slot.
+	// Keep it cached there; updating text never waits for another slot's copy.
+	if (!a_upload || a_upload->GetDesc().Width != uploadSize) {
+		const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+		const auto desc = CD3DX12_RESOURCE_DESC::Buffer(uploadSize);
+		winrt::com_ptr<ID3D12Resource> replacement;
+		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(replacement.put())))) {
+			return;
+		}
+		a_upload = std::move(replacement);
 	}
 
 	std::vector<uint32_t> pixels(textureWidth * textureHeight);
 	DrawTextToBuffer(cachedText, pixels, textureWidth, textureHeight);
 
 	uint8_t* mapped = nullptr;
-	if (FAILED(textureUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+	if (FAILED(a_upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)))) {
 		return;
 	}
 	for (uint32_t y = 0; y < textureHeight; ++y) {
 		std::memcpy(mapped + y * uploadRowPitch, pixels.data() + y * textureWidth, textureWidth * sizeof(uint32_t));
 	}
-	textureUpload->Unmap(0, nullptr);
+	a_upload->Unmap(0, nullptr);
 
 	auto before = CD3DX12_RESOURCE_BARRIER::Transition(texture.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 	a_commandList->ResourceBarrier(1, &before);
@@ -613,7 +623,7 @@ void OSD::UpdateTexture(ID3D12GraphicsCommandList* a_commandList)
 	destination.SubresourceIndex = 0;
 
 	D3D12_TEXTURE_COPY_LOCATION source{};
-	source.pResource = textureUpload.get();
+	source.pResource = a_upload.get();
 	source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	source.PlacedFootprint.Offset = 0;
 	source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -661,6 +671,7 @@ void OSD::Draw(ID3D12GraphicsCommandList* a_commandList, ID3D12Resource* a_backB
 void OSD::Render(
 	ID3D12Device* a_device,
 	ID3D12GraphicsCommandList* a_commandList,
+	winrt::com_ptr<ID3D12Resource>& a_upload,
 	ID3D12Resource* a_backBuffer,
 	uint32_t a_backBufferIndex,
 	DXGI_FORMAT a_backBufferFormat,
@@ -690,7 +701,7 @@ void OSD::Render(
 		cachedText = BuildText();
 		textureDirty = true;
 	}
-	UpdateTexture(a_commandList);
+	UpdateTexture(a_commandList, a_upload);
 	Draw(a_commandList, a_backBuffer, a_backBufferIndex);
 }
 

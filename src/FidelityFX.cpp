@@ -385,8 +385,8 @@ bool FidelityFX::ConfigureFrameGeneration(
 			static_cast<uint32_t>(frameGenDisplaySize.x) != displayWidth ||
 			static_cast<uint32_t>(frameGenDisplaySize.y) != displayHeight ||
 			frameGenBackBufferFormat != a_backBufferFormat);
-	if (recreateFrameGenerationContext) {
-		DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+	if (recreateFrameGenerationContext && !DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
+		return false;
 	}
 	if (!EnsureFrameGenerationContext(a_device, a_displaySize, a_backBufferFormat)) {
 		return false;
@@ -542,8 +542,8 @@ bool FidelityFX::UpscaleD3D12(
 			static_cast<uint32_t>(contextRenderSize.y) != renderHeight ||
 			static_cast<uint32_t>(contextDisplaySize.x) != displayWidth ||
 			static_cast<uint32_t>(contextDisplaySize.y) != displayHeight);
-	if (recreateUpscaleContext) {
-		DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+	if (recreateUpscaleContext && !DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
+		return false;
 	}
 	if (!EnsureContext(a_device, a_renderSize, a_displaySize)) {
 		return false;

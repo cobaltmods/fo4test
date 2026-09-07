@@ -19,6 +19,7 @@
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
+#include "ReShadeDepth.h"
 
 extern bool enbLoaded;
 
@@ -1220,6 +1221,12 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 	static void thunk(RE::BSGraphics::RenderTargetManager* This, uint a2, uint a3, uint a4, uint a5)
 	{
 		auto upscaling = Upscaling::GetSingleton();
+		// Capture after all return paths have restored the original depth SRV,
+		// and before native UI can clear or replace the scene depth.
+		struct CaptureDepthOnExit
+		{
+			~CaptureDepthOnExit() { Upscaling::GetSingleton()->CaptureReShadeDepth(); }
+		} captureDepthOnExit;
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		static auto gameViewport = Util::State_GetSingleton();
@@ -1351,6 +1358,7 @@ struct DrawWorld_FrameGenerationForward
 	static void thunk(void* This)
 	{
 		func(This);
+		Upscaling::GetSingleton()->reshadeSceneDepthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
 
 		if (!frameGenerationFirstPersonAlphaFix) {
 			Upscaling::GetSingleton()->CopyFrameGenerationBuffers();
@@ -3127,7 +3135,9 @@ void Upscaling::CheckResources()
 		if (dx12Ready) {
 			// SDK feature destruction and shared-resource release are only safe
 			// after all queued evaluations and intercepted Presents have drained.
-			DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+			if (!DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
+				return;  // Keep the old resources and retry the transaction next frame.
+			}
 		}
 		for (std::size_t i = 0; i < dlssD3D12InputsReady.size(); ++i) {
 			dlssgInputsReady[i] = false;
@@ -3542,6 +3552,12 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	ID3D11RenderTargetView* currentRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
 	ID3D11DepthStencilView* currentDSV = nullptr;
 	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, &currentDSV);
+	std::array<winrt::com_ptr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> retainedRTVs;
+	for (std::size_t i = 0; i < retainedRTVs.size(); ++i) {
+		retainedRTVs[i].attach(currentRTVs[i]);
+	}
+	winrt::com_ptr<ID3D11DepthStencilView> retainedDSV;
+	retainedDSV.attach(currentDSV);
 
 	// Unbind render targets to avoid resource hazards
 	context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -3550,19 +3566,12 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	if (!frameBufferSRV) {
 		logger::warn("[Upscaling] Cannot upscale RT{}: missing SRV", a_renderTargetIndex);
 		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, currentDSV);
-		for (auto* rtv : currentRTVs) {
-			if (rtv) {
-				rtv->Release();
-			}
-		}
-		if (currentDSV) {
-			currentDSV->Release();
-		}
 		return;
 	}
 
-	ID3D11Resource* frameBufferResource;
-	frameBufferSRV->GetResource(&frameBufferResource);
+	winrt::com_ptr<ID3D11Resource> frameBufferOwner;
+	frameBufferSRV->GetResource(frameBufferOwner.put());
+	auto* frameBufferResource = frameBufferOwner.get();
 	const auto upscaleInputName = std::format("upscale_target_P{}", a_renderTargetIndex);
 	if (ENBRenderDomain::Get().Active()) {
 		D3D11_TEXTURE2D_DESC sceneDesc{};
@@ -3577,15 +3586,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				loggedMismatch = true;
 			}
 			context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, currentDSV);
-			for (auto* rtv : currentRTVs) {
-				if (rtv) {
-					rtv->Release();
-				}
-			}
-			if (currentDSV) {
-				currentDSV->Release();
-			}
-			frameBufferResource->Release();
 			return;
 		}
 	}
@@ -3615,15 +3615,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		context->CopyResource(upscalingTexture->resource.get(), frameBufferResource);
 	}
 
-	for (auto* rtv : currentRTVs) {
-		if (rtv) {
-			rtv->Release();
-		}
-	}
-	if (currentDSV) {
-		currentDSV->Release();
-	}
-
 	// Allocate temporal resources, then dilate only when the result is consumed.
 	if (upscaleMethod == UpscaleMethod::kDLSS || upscaleMethod == UpscaleMethod::kFSR || frameGenerationActive || fsrFrameGenerationActive) {
 		if ((upscaleMethod == UpscaleMethod::kDLSS && !dlssOutputTexture) || !dilatedMotionVectorTexture) {
@@ -3639,7 +3630,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				} else if (fsrFrameGenerationActive) {
 					ReportFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration, e.what());
 				}
-				frameBufferResource->Release();
 				return;
 			}
 		}
@@ -3655,7 +3645,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			} else if (fsrFrameGenerationActive) {
 				ReportFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration, "upscaling resources");
 			}
-			frameBufferResource->Release();
 			return;
 		}
 
@@ -4004,7 +3993,113 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			context->ClearRenderTargetView(rtv, transparent);
 		}
 	}
-	frameBufferResource->Release();
+}
+
+ID3D12Resource* Upscaling::GetCurrentSharedDepth() const
+{
+	const auto slot = DX12SwapChain::GetSingleton()->GetFrameIndex();
+	if (slot >= kDX12FrameCount) {
+		return nullptr;
+	}
+	const auto frame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	if (dlssDepthCaptureFrames[slot] == frame && dlssgDepthD3D12[slot]) {
+		return dlssgDepthD3D12[slot].get();
+	}
+	if (fsrDepthCaptureFrames[slot] == frame && fsrDepthD3D12[slot]) {
+		return fsrDepthD3D12[slot].get();
+	}
+	return reshadeDepthCaptureFrames[slot] == frame ? reshadeDepthD3D12[slot].get() : nullptr;
+}
+
+void Upscaling::CaptureReShadeDepth()
+{
+	auto* swap = DX12SwapChain::GetSingleton();
+	if (!ReShadeDepth::IsRequested() || !swap->IsReady() || swap->IsWindowUnavailable() || GetCurrentSharedDepth()) {
+		return;
+	}
+	const auto slot = swap->GetFrameIndex();
+	if (slot >= kDX12FrameCount) {
+		return;
+	}
+	reshadeDepthCaptureFrames[slot] = 0;
+	if (reshadeSceneDepthFrame != static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1) {
+		return;  // A restored/frozen background is not a new world-depth render.
+	}
+	try {
+		auto* data = RE::BSGraphics::GetRendererData();
+		auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(data->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+		if (!srv) {
+			return;
+		}
+		winrt::com_ptr<ID3D11Resource> resource;
+		srv->GetResource(resource.put());
+		auto texture = resource.try_as<ID3D11Texture2D>();
+		if (!texture) {
+			return;
+		}
+		D3D11_TEXTURE2D_DESC desc{};
+		texture->GetDesc(&desc);
+		if (desc.SampleDesc.Count != 1) {
+			return;
+		}
+		if (ENBRenderDomain::Get().Active()) {
+			desc.Width = std::min(desc.Width, ENBRenderDomain::Get().Width());
+			desc.Height = std::min(desc.Height, ENBRenderDomain::Get().Height());
+		} else {
+			const auto* state = Util::State_GetSingleton();
+			const auto ratios = GetDynamicResolutionRatios();
+			desc.Width = std::min(desc.Width, std::max(1u, static_cast<UINT>(state->screenWidth * ratios.width)));
+			desc.Height = std::min(desc.Height, std::max(1u, static_cast<UINT>(state->screenHeight * ratios.height)));
+		}
+		desc.Format = DXGI_FORMAT_R32_FLOAT;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = 0;
+		auto* shader = GetCopyDepthToFrameGenerationCS();
+		if (!shader || !swap->WaitForFrameSlot(slot, true)) {
+			return;
+		}
+		EnsureSharedD3D12Texture(this, desc, reshadeDepthSharedTextures[slot], reshadeDepthD3D12[slot], true);
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
+		// Preserve the exact state touched by this optional fallback dispatch.
+		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+		winrt::com_ptr<ID3D11DepthStencilView> dsv;
+		context->OMGetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.put());
+		winrt::com_ptr<ID3D11ComputeShader> oldShader;
+		ID3D11ClassInstance* instances[256]{};
+		UINT instanceCount = static_cast<UINT>(std::size(instances));
+		context->CSGetShader(oldShader.put(), instances, &instanceCount);
+		winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
+		winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
+		context->CSGetShaderResources(0, 1, oldSRV.put());
+		context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
+		context->OMSetRenderTargets(0, nullptr, nullptr);
+		context->CSSetShaderResources(0, 1, &srv);
+		auto* uav = reshadeDepthSharedTextures[slot]->uav.get();
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(shader, nullptr, 0);
+		context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		ID3D11UnorderedAccessView* nullUAV = nullptr;
+		context->CSSetShaderResources(0, 1, &nullSRV);
+		context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+		auto* restoreSRV = oldSRV.get();
+		auto* restoreUAV = oldUAV.get();
+		context->CSSetShaderResources(0, 1, &restoreSRV);
+		context->CSSetUnorderedAccessViews(0, 1, &restoreUAV, nullptr);
+		context->CSSetShader(oldShader.get(), instances, instanceCount);
+		context->OMSetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.get());
+		for (auto* rtv : rtvs) {
+			if (rtv) rtv->Release();
+		}
+		for (UINT i = 0; i < instanceCount; ++i) {
+			if (instances[i]) instances[i]->Release();
+		}
+		reshadeDepthCaptureFrames[slot] = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	} catch (const std::exception& e) {
+		logger::error("[ReShade depth] Fallback capture failed: {}", e.what());
+	}
 }
 
 bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize)
@@ -4020,6 +4115,7 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	if (frameIndex >= fsrD3D12InputsReady.size()) {
 		return false;
 	}
+	fsrDepthCaptureFrames[frameIndex] = 0;
 	if (!dx12SwapChain->WaitForFrameSlot(frameIndex, true)) {
 		return false;
 	}
@@ -4130,6 +4226,9 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 			frameGenerationDepthTexture->resource.get(),
 			0,
 			&sourceBox);
+		if (patchedDepthDesc.Width >= depthDesc.Width && patchedDepthDesc.Height >= depthDesc.Height) {
+			fsrDepthCaptureFrames[frameIndex] = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+		}
 	}
 	else if (depthSRV && fsrDepthSharedTextures[frameIndex]->uav) {
 		UpdateAndBindUpscalingCB(context, a_displaySize, a_renderSize);
@@ -4139,12 +4238,16 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 
 		ID3D11UnorderedAccessView* uavs[] = { fsrDepthSharedTextures[frameIndex]->uav.get() };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-		context->CSSetShader(GetOverrideDepthCS(), nullptr, 0);
+		auto* depthShader = GetOverrideDepthCS();
+		context->CSSetShader(depthShader, nullptr, 0);
 
 		const auto dispatchX = static_cast<uint>(std::ceil(a_renderSize.x / 8.0f));
 		const auto dispatchY = static_cast<uint>(std::ceil(a_renderSize.y / 8.0f));
 		context->Dispatch(dispatchX, dispatchY, 1);
 		ClearDLSSGComputeBindings(context);
+		if (depthShader) {
+			fsrDepthCaptureFrames[frameIndex] = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+		}
 	}
 
 	fsrInputJitters[frameIndex] = a_jitter;
@@ -4164,6 +4267,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	// A resource remaining alive does not mean it contains this frame's inputs.
 	const auto captureIndex = DX12SwapChain::GetSingleton()->GetFrameIndex();
 	if (captureIndex < dlssD3D12InputsReady.size()) {
+		dlssDepthCaptureFrames[captureIndex] = 0;
 		dlssD3D12InputsReady[captureIndex] = false;
 		dlssgInputsReady[captureIndex] = false;
 		fsrFrameGenerationInputsReady[captureIndex] = false;
@@ -4185,8 +4289,9 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		return;
 	}
 
-	ID3D11Resource* frameBufferResource = nullptr;
-	frameBufferSRV->GetResource(&frameBufferResource);
+	winrt::com_ptr<ID3D11Resource> frameBufferOwner;
+	frameBufferSRV->GetResource(frameBufferOwner.put());
+	auto* frameBufferResource = frameBufferOwner.get();
 	if (!frameBufferResource) {
 		return;
 	}
@@ -4236,7 +4341,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				logger::error("[ENB domain] Depth/motion allocations do not match scene {}x{}; temporal evaluation skipped", domain.Width(), domain.Height());
 				loggedGuideMismatch = true;
 			}
-			frameBufferResource->Release();
 			return;
 		}
 	}
@@ -4246,17 +4350,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	if (DX12SwapChain::GetSingleton()->IsReady()) {
 		auto dx12SwapChain = DX12SwapChain::GetSingleton();
 		if (!motionVectorTexture) {
-			frameBufferResource->Release();
 			return;
 		}
 
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
 		if (frameIndex >= dlssgInputsReady.size()) {
-			frameBufferResource->Release();
 			return;
 		}
 		if (!dx12SwapChain->WaitForFrameSlot(frameIndex, useD3D12DLSS)) {
-			frameBufferResource->Release();
 			return;
 		}
 		dlssgInputsReady[frameIndex] = false;
@@ -4416,6 +4517,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			RetireD3D11Texture(dlssgDepthSharedTextures[frameIndex]);
 			RetireD3D12Resource(dlssgDepthD3D12[frameIndex]);
 			dlssgDepthD3D12[frameIndex].copy_from(fsrDepthD3D12[frameIndex].get());
+			dlssDepthCaptureFrames[frameIndex] = fsrDepthCaptureFrames[frameIndex];
 		} else {
 			EnsureSharedD3D12Texture(this, sharedDepthDesc, dlssgDepthSharedTextures[frameIndex], dlssgDepthD3D12[frameIndex], true);
 
@@ -4440,6 +4542,9 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 					frameGenerationDepthTexture->resource.get(),
 					0,
 					&sourceBox);
+				if (patchedDepthDesc.Width >= sharedDepthDesc.Width && patchedDepthDesc.Height >= sharedDepthDesc.Height) {
+					dlssDepthCaptureFrames[frameIndex] = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+				}
 			}
 			else if (depthSRV && dlssgDepthSharedTextures[frameIndex]->uav) {
 				UpdateAndBindUpscalingCB(context, a_displaySize, a_renderSize);
@@ -4449,12 +4554,16 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 
 				ID3D11UnorderedAccessView* uavs[] = { dlssgDepthSharedTextures[frameIndex]->uav.get() };
 				context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-				context->CSSetShader(GetOverrideDepthCS(), nullptr, 0);
+				auto* depthShader = GetOverrideDepthCS();
+				context->CSSetShader(depthShader, nullptr, 0);
 
 				const auto dispatchX = static_cast<uint>(std::ceil(a_renderSize.x / 8.0f));
 				const auto dispatchY = static_cast<uint>(std::ceil(a_renderSize.y / 8.0f));
 				context->Dispatch(dispatchX, dispatchY, 1);
 				ClearDLSSGComputeBindings(context);
+				if (depthShader) {
+					dlssDepthCaptureFrames[frameIndex] = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+				}
 			}
 		}
 
@@ -4470,11 +4579,9 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			streamline->UpdateReflex(settings.reflexMode, false);
 			if (!streamline->UpdateConstants(jitter)) {
 				ReportFeatureRequestFailure(FeatureRequest::kDLSS, "Streamline SR common constants");
-				frameBufferResource->Release();
 				return;
 			}
 		} else if (!useD3D12DLSS && useFrameGeneration && !useDLSSGThisFrame) {
-			frameBufferResource->Release();
 			return;
 		}
 		const auto dlssgInputSize = float2(static_cast<float>(sharedMotionVectorDesc.Width), static_cast<float>(sharedMotionVectorDesc.Height));
@@ -4483,7 +4590,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
 				useDLSSGThisFrame = false;
 				if (!useD3D12DLSS) {
-					frameBufferResource->Release();
 					return;
 				}
 			}
@@ -4502,7 +4608,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		dlssD3D12MotionVectorFormats[frameIndex] = sharedMotionVectorDesc.Format;
 		dlssD3D12DepthFormats[frameIndex] = sharedDepthDesc.Format;
 
-		frameBufferResource->Release();
 		return;
 	}
 
@@ -4517,17 +4622,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	streamline->UpdateReflex(settings.reflexMode, true);
 	if (!streamline->UpdateConstants(jitter)) {
 		ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline common constants");
-		frameBufferResource->Release();
 		return;
 	}
 	if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, a_renderSize, a_displaySize, frameBufferDesc.Format, motionVectorDesc.Format, depthDesc.Format)) {
 		ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
-		frameBufferResource->Release();
 		return;
 	}
 	streamline->TagDLSSGResources(dlssgHUDLessTexture->resource.get(), motionVectorTexture, depthTexture, a_renderSize, a_displaySize);
 
-	frameBufferResource->Release();
 }
 
 bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
@@ -4855,6 +4957,13 @@ void Upscaling::CreateUpscalingResources()
 
 void Upscaling::DestroyUpscalingResources()
 {
+	dlssDepthCaptureFrames.fill(0);
+	fsrDepthCaptureFrames.fill(0);
+	reshadeDepthCaptureFrames.fill(0);
+	reshadeSceneDepthFrame = 0;
+	for (std::size_t i = 0; i < kDX12FrameCount; ++i) {
+		RetireSharedD3D12Texture(reshadeDepthSharedTextures[i], reshadeDepthD3D12[i]);
+	}
 	RetireD3D11Texture(upscalingTexture);
 	RetireD3D11Texture(dlssOutputTexture);
 	RetireD3D11Texture(spatialFallbackTexture);

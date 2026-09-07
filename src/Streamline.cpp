@@ -8,6 +8,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "DX12SwapChain.h"
+#include "ENBRenderDomain.h"
 #include "Util.h"
 
 namespace
@@ -1476,11 +1477,6 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.options.localStructureStrength = a_dlssNROptions.localStructureStrength;
 		parameters.options.skinStructureStrength = a_dlssNROptions.skinStructureStrength;
 		parameters.options.useAutoMask = a_dlssNROptions.useAutoMask == sl::Boolean::eTrue;
-		if (directDLSSNR.NeedsFeatureRecreation(parameters)) {
-			// NGX releases the old feature during recreation. Its internal resources
-			// may still be referenced by earlier frames, so drain the owning queue first.
-			DX12SwapChain::GetSingleton()->WaitForGPUIdle();
-		}
 		return directDLSSNR.Evaluate(a_commandList, parameters);
 	};
 
@@ -1651,6 +1647,34 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 		lastTemporalResetFrameIndex = currentFrameIndex;
 	}
 	return true;
+}
+
+bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const
+{
+	const auto* upscaling = Upscaling::GetSingleton();
+	if (dlssNRSuspended || (featureDLSSNR && slDLSSNRSetOptions) ||
+		!upscaling->settings.dlssNREnabled || a_slot >= upscaling->dlssD3D12InputsReady.size() ||
+		!upscaling->dlssD3D12InputsReady[a_slot] || !upscaling->dlssSharpenedD3D12[a_slot]) {
+		return false;
+	}
+	const auto size = upscaling->dlssgInputRenderSizes[a_slot];
+	a_parameters = {};
+	a_parameters.inputWidth = a_parameters.outputWidth = a_parameters.guideWidth = static_cast<uint32_t>(size.x);
+	a_parameters.inputHeight = a_parameters.outputHeight = a_parameters.guideHeight = static_cast<uint32_t>(size.y);
+	const auto quality = ENBRenderDomain::Get().Active() ? ENBRenderDomain::Get().Quality() : upscaling->settings.qualityMode;
+	// Same NGX mapping as DLSSNRPerformanceMode: DLAA, Quality, Balanced,
+	// Performance, Ultra Performance. The explicit NR mode takes precedence.
+	constexpr uint32_t modes[]{ 6, 3, 2, 1, 4 };
+	const auto requested = upscaling->settings.dlssNRPerformanceMode;
+	a_parameters.options.performanceMode = requested == 0 ? modes[quality < std::size(modes) ? quality : 0] :
+		requested == 5 ? 6 : requested;
+	a_parameters.options.preset = upscaling->settings.dlssNRPreset;
+	return directDLSSNR.NeedsFeaturePreparation(a_parameters);
+}
+
+bool Streamline::PrepareD3D12DLSSNR(ID3D12GraphicsCommandList* a_list, const nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters)
+{
+	return directDLSSNR.PrepareFeature(a_list, a_parameters);
 }
 
 void Streamline::DisableDLSS()

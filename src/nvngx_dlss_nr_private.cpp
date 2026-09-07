@@ -112,6 +112,9 @@ namespace nvngx::dlss_nr
 		}
 
 		Shutdown();
+		if (runtime_ || device_) {
+			return;  // Failed shutdown still owns the old runtime and its resources.
+		}
 		runtimeDirectory_ = a_runtimeDirectory;
 	}
 
@@ -441,8 +444,8 @@ namespace nvngx::dlss_nr
 			return false;
 		}
 
-		if (NeedsFeatureRecreation(a_parameters)) {
-			ReleaseFeature();
+		if ((NeedsFeatureRecreation(a_parameters) || (!feature_ && parameters_)) && !ReleaseFeature()) {
+			return false;
 		}
 		if (feature_) {
 			return true;
@@ -451,7 +454,7 @@ namespace nvngx::dlss_nr
 		const auto allocateResult = allocateParameters_(&parameters_);
 		if (!IsNGXSuccess(allocateResult) || !parameters_) {
 			logger::warn("[DLSS-NR Direct] AllocateParameters failed result=0x{:08X}", static_cast<std::uint32_t>(allocateResult));
-			parameters_ = nullptr;
+			// Retain any returned allocation for its matching DestroyParameters.
 			return false;
 		}
 
@@ -460,20 +463,19 @@ namespace nvngx::dlss_nr
 		auto snippetCreateResult = createFeature_ == snippetCreateFeature_ ? createResult : NVSDK_NGX_Result_Success;
 		activeEvaluateFeature_ = evaluateFeature_;
 		activeReleaseFeature_ = releaseFeature_;
-		if ((!IsNGXSuccess(createResult) || !feature_) && createFeature_ != snippetCreateFeature_) {
+		if (!feature_ && createFeature_ != snippetCreateFeature_) {
 			// Match RenoDX's creation sequence: the shared NGX core gets the first
 			// chance, then feature 18 is created through the signed snippet when the
 			// core reports UnableToInitializeFeature. Evaluation never retries across
 			// backends; it is bound to the creator selected here.
-			feature_ = nullptr;
+			activeEvaluateFeature_ = snippetEvaluateFeature_;
+			activeReleaseFeature_ = snippetReleaseFeature_;
 			snippetCreateResult = snippetCreateFeature_(
 				a_commandList,
 				NVSDK_NGX_Feature_DLSSNR,
 				parameters_,
 				&feature_);
 			if (IsNGXSuccess(snippetCreateResult) && feature_) {
-				activeEvaluateFeature_ = snippetEvaluateFeature_;
-				activeReleaseFeature_ = snippetReleaseFeature_;
 				logger::info(
 					"[DLSS-NR Direct] Shared NGX CreateFeature returned 0x{:08X}; feature 18 was created by nvngx_dlssnr.dll",
 					static_cast<std::uint32_t>(createResult));
@@ -491,11 +493,10 @@ namespace nvngx::dlss_nr
 				a_parameters.outputHeight,
 				a_parameters.options.performanceMode,
 				a_parameters.options.preset);
-			feature_ = nullptr;
-			activeEvaluateFeature_ = nullptr;
-			activeReleaseFeature_ = nullptr;
-			destroyParameters_(parameters_);
-			parameters_ = nullptr;
+			// A failed create may still return a handle or record GPU work. Keep
+			// its creator's release function and parameters; the next recreation
+			// drains submitted work before cleanup. Never overwrite that handle
+			// with another backend's fallback result.
 			return false;
 		}
 
@@ -587,15 +588,8 @@ namespace nvngx::dlss_nr
 				featurePreset_ != a_parameters.options.preset);
 	}
 
-	bool D3D12Backend::Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
+	bool D3D12Backend::NeedsFeaturePreparation(const D3D12EvaluationParameters& a_parameters) const
 	{
-		if (!a_commandList || !a_parameters.color || !a_parameters.output ||
-			!a_parameters.motionVectors || !a_parameters.depth ||
-			!a_parameters.inputWidth || !a_parameters.inputHeight ||
-			!a_parameters.outputWidth || !a_parameters.outputHeight ||
-			!a_parameters.guideWidth || !a_parameters.guideHeight) {
-			return false;
-		}
 		const auto sameFailedConfiguration =
 			failedInputWidth_ == a_parameters.inputWidth &&
 			failedInputHeight_ == a_parameters.inputHeight &&
@@ -606,6 +600,15 @@ namespace nvngx::dlss_nr
 			failedPerformanceMode_ == a_parameters.options.performanceMode &&
 			failedPreset_ == a_parameters.options.preset;
 		if (failureLatched_ && sameFailedConfiguration) {
+			return false;
+		}
+		return !initialized_ || !feature_ || NeedsFeatureRecreation(a_parameters) || failureLatched_;
+	}
+
+	bool D3D12Backend::PrepareFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
+	{
+		if (!a_commandList || !a_parameters.inputWidth || !a_parameters.inputHeight ||
+			!a_parameters.outputWidth || !a_parameters.outputHeight) {
 			return false;
 		}
 		if (failureLatched_) {
@@ -636,6 +639,20 @@ namespace nvngx::dlss_nr
 			return false;
 		}
 
+		return true;
+	}
+
+	bool D3D12Backend::Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
+	{
+		// Evaluation never initializes, releases or recreates NGX resources.
+		if (!a_commandList || !a_parameters.color || !a_parameters.output ||
+			!a_parameters.motionVectors || !a_parameters.depth ||
+			!a_parameters.inputWidth || !a_parameters.inputHeight ||
+			!a_parameters.outputWidth || !a_parameters.outputHeight ||
+			!a_parameters.guideWidth || !a_parameters.guideHeight ||
+			!initialized_ || !feature_ || failureLatched_ || NeedsFeatureRecreation(a_parameters)) {
+			return false;
+		}
 		const auto reset = forceReset_ || a_parameters.reset;
 		SetEvaluationParameters(a_parameters, reset);
 
@@ -696,22 +713,32 @@ namespace nvngx::dlss_nr
 		forceReset_ = true;
 	}
 
-	void D3D12Backend::ReleaseFeature()
+	bool D3D12Backend::ReleaseFeature()
 	{
-		if (feature_ && activeReleaseFeature_) {
+		// A failed release must not make this feature eligible for evaluation.
+		featureInputWidth_ = 0;
+		if (feature_) {
+			if (!activeReleaseFeature_) {
+				return false;
+			}
 			const auto result = activeReleaseFeature_(feature_);
 			if (!IsNGXSuccess(result)) {
 				logger::warn("[DLSS-NR Direct] ReleaseFeature failed result=0x{:08X}", static_cast<std::uint32_t>(result));
+				return false;
 			}
 		}
 		feature_ = nullptr;
 		activeEvaluateFeature_ = nullptr;
 		activeReleaseFeature_ = nullptr;
 
-		if (parameters_ && destroyParameters_) {
+		if (parameters_) {
+			if (!destroyParameters_) {
+				return false;
+			}
 			const auto result = destroyParameters_(parameters_);
 			if (!IsNGXSuccess(result)) {
 				logger::warn("[DLSS-NR Direct] DestroyParameters failed result=0x{:08X}", static_cast<std::uint32_t>(result));
+				return false;
 			}
 		}
 		parameters_ = nullptr;
@@ -731,15 +758,19 @@ namespace nvngx::dlss_nr
 		failedPerformanceMode_ = 0;
 		failedPreset_ = 0;
 		forceReset_ = true;
+		return true;
 	}
 
 	void D3D12Backend::Shutdown()
 	{
-		ReleaseFeature();
+		if (!ReleaseFeature()) {
+			return;
+		}
 		if (initialized_ && shutdown_) {
 			const auto result = shutdown_(device_);
 			if (!IsNGXSuccess(result)) {
 				logger::warn("[DLSS-NR Direct] Shutdown failed result=0x{:08X}", static_cast<std::uint32_t>(result));
+				return;
 			}
 		}
 		initialized_ = false;

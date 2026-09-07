@@ -12,3 +12,8 @@
 build*/
 vs*/
 extern*/
+
+# Keep only the vendored public ReShade SDK in source control.
+!/extern/
+/extern/*
+!/extern/ReShade/

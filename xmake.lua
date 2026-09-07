@@ -5,7 +5,7 @@ includes("lib/commonlibf4")
 
 -- set project constants
 set_project("Upscaling")
-set_version("1.5.2")
+set_version("1.5.3")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
@@ -26,6 +26,15 @@ target("Upscaling")
     set_extension(".dll")
     add_deps("commonlibf4")
     add_packages("directxtk", "directx-headers", "magic_enum", "simpleini")
+
+    on_load(function (target)
+        import("core.base.semver")
+        local version = semver.new(target:version())
+        target:add("defines",
+            "UPSCALING_VERSION_MAJOR=" .. version:major(),
+            "UPSCALING_VERSION_MINOR=" .. version:minor(),
+            "UPSCALING_VERSION_PATCH=" .. version:patch())
+    end)
 
     -- add src files
     add_files("src/**.cpp")

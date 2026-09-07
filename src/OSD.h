@@ -23,6 +23,7 @@ public:
 	void Render(
 		ID3D12Device* a_device,
 		ID3D12GraphicsCommandList* a_commandList,
+		winrt::com_ptr<ID3D12Resource>& a_upload,
 		ID3D12Resource* a_backBuffer,
 		uint32_t a_backBufferIndex,
 		DXGI_FORMAT a_backBufferFormat,
@@ -40,7 +41,7 @@ private:
 	bool EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat, uint32_t a_width, uint32_t a_height);
 	void EnsureAdapter(ID3D12Device* a_device);
 	void UpdateStats();
-	void UpdateTexture(ID3D12GraphicsCommandList* a_commandList);
+	void UpdateTexture(ID3D12GraphicsCommandList* a_commandList, winrt::com_ptr<ID3D12Resource>& a_upload);
 	void Draw(ID3D12GraphicsCommandList* a_commandList, ID3D12Resource* a_backBuffer, uint32_t a_backBufferIndex);
 	std::string BuildText() const;
 	std::string BuildCompactText() const;
@@ -53,7 +54,6 @@ private:
 	winrt::com_ptr<ID3D12DescriptorHeap> srvHeap;
 	winrt::com_ptr<ID3D12DescriptorHeap> rtvHeap;
 	winrt::com_ptr<ID3D12Resource> texture;
-	winrt::com_ptr<ID3D12Resource> textureUpload;
 	winrt::com_ptr<ID3D12Resource> vertexBuffer;
 	D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
 	DXGI_FORMAT currentBackBufferFormat = DXGI_FORMAT_UNKNOWN;

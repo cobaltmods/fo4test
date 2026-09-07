@@ -112,9 +112,12 @@ namespace nvngx::dlss_nr
 		void SetRuntimeDirectory(const std::filesystem::path& a_runtimeDirectory);
 		bool Prepare(ID3D12Device* a_device);
 		bool NeedsFeatureRecreation(const D3D12EvaluationParameters& a_parameters) const;
+		bool NeedsFeaturePreparation(const D3D12EvaluationParameters& a_parameters) const;
+		// Caller drains submitted work before this lifecycle-only recording step.
+		bool PrepareFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		bool Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		void RequestReset();
-		void ReleaseFeature();
+		bool ReleaseFeature();
 		void Shutdown();
 
 	private:
