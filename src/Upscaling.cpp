@@ -1618,8 +1618,8 @@ void Upscaling::InstallHooks()
 
 	stl::detour_thunk_gateway<UI_ScreenSpace_RenderMenus_Native>(
 		REL::ID{ 230711, 2284762 }, 5, "UI::ScreenSpace_RenderMenus overlay composition");
+	NativeInterfaceUI::InstallHooks(enbLoaded);
 	if (enbLoaded) {
-		NativeInterfaceUI::InstallHooks();
 		InstallNativeENBOverlay();
 		stl::detour_thunk_gateway<Scaleform_SetNativeScreenTarget>(
 			REL::ID{ 1175949, 2284944 }, 6, "BSScaleformRenderer::SetCurrentRenderTarget native UI");
@@ -1930,9 +1930,6 @@ RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a
 		if (!a_event.opening) {
 			singleton->ReloadSettingsIfChanged();
 		}
-	}
-	if (a_event.menuName == "ScopeMenu") {
-		singleton->scopeMenuOpen = a_event.opening;
 	}
 
 	return RE::BSEventNotifyControl::kContinue;
@@ -3909,7 +3906,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			}
 			runSpatialFallbackNow("D3D12 FSR input failure");
 		} else if (!fsrFrameGenerationActive) {
-			const auto usePresentOverride = getD3D12FSROutput() != nullptr && (virtualENB || !scopeMenuOpen);
+			const auto usePresentOverride = getD3D12FSROutput() != nullptr;
 			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, !usePresentOverride);
 			if (d3d12Result.fsr) {
 				if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput())) {
@@ -3971,10 +3968,9 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			frameIndex < dlssD3D12InputsReady.size() &&
 			dlssD3D12InputsReady[frameIndex] &&
 			getD3D12DLSSOutput();
-		const bool hasPresentOverrideOutput =
+		const bool usePresentOverride =
 			dlssPresentOverrideReady ||
 			(requestedD3D12FSR && getD3D12FSROutput());
-		const auto usePresentOverride = hasPresentOverrideOutput && (virtualENB || !scopeMenuOpen);
 		const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(
 			requestedD3D12DLSS,
 			requestedD3D12FSR,

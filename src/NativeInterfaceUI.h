@@ -4,7 +4,7 @@
 
 namespace NativeInterfaceUI
 {
-	void InstallHooks();
+	void InstallHooks(bool a_nativeDomains);
 	void ReleaseResources();
 	bool IsRendering();
 	void RenderModelsBeforeUpscale(uint32_t a_target);

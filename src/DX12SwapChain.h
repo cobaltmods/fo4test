@@ -110,6 +110,8 @@ public:
 	bool WaitForInteropIdle();
 	HRESULT ResizeENBScene(uint32_t a_quality);
 	bool BeginNativeUI();
+	// Preserve destination-dependent engine menu blending before its first draw.
+	bool PrepareNativeUIForEngineComposition();
 	void PublishNativeUIForOverlays();
 	void EndNativeUI();
 	// A same-frame, display-sized image for the engine's synchronous screenshot encoder.

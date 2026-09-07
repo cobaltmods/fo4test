@@ -15,6 +15,7 @@ namespace
 {
 	bool enabled = false;
 	thread_local bool rendering = false;
+	thread_local bool nativeScreenPass = false;
 	thread_local int colorTarget = 0;
 	thread_local int depthTarget = 0;
 	bool modelHooksInstalled = false;
@@ -42,6 +43,23 @@ namespace
 		static void thunk(RE::Interface3D::Renderer* a_renderer)
 		{
 			if (!AlreadyRendered(a_renderer)) {
+				const auto effect = a_renderer->postfx.get();
+				const bool usesHUDGlass = effect == RE::Interface3D::PostEffect::kHUDGlass ||
+					effect == RE::Interface3D::PostEffect::kHUDGlassWithMod ||
+					(a_renderer->screenAttachedElementRoot &&
+						a_renderer->screenMaterialName == "Materials\\Interface\\HUDGlassFlat.BGEM");
+				if (nativeScreenPass && usesHUDGlass) {
+					// HUDGlass and its shadow material do not produce a generic
+					// coverage-alpha overlay. Supply the real destination BEFORE
+					// prepasses/RenderMain, then keep the engine's completed RGB.
+					if (DX12SwapChain::GetSingleton()->PrepareNativeUIForEngineComposition()) {
+						static bool announced = false;
+						if (!announced) {
+							logger::info("[UI composite] HUDGlass uses engine frame composition; final alpha recomposition bypassed");
+							announced = true;
+						}
+					}
+				}
 				func(a_renderer);
 			}
 		}
@@ -184,8 +202,15 @@ namespace
 	// follow each color binding, not just the post-AA RenderAll invocation.
 	struct RenderScope
 	{
-		RenderScope() { rendering = true; }
-		~RenderScope() { nativeDepth.Restore(); rendering = false; }
+		RenderScope()
+		{
+			rendering = true;
+		}
+		~RenderScope()
+		{
+			nativeDepth.Restore();
+			rendering = false;
+		}
 	};
 
 	void UpdateDepthBinding(RE::BSGraphics::RenderTargetManager* a_manager)
@@ -306,6 +331,14 @@ namespace
 	{
 		static void thunk(uint32_t a_target, bool a_postAA)
 		{
+			// Composition is common to both proxy paths; native depth/viewport
+			// routing remains ENB-only. Restore the pass flag across nested calls.
+			struct ScreenPassScope
+			{
+				bool previous = nativeScreenPass;
+				explicit ScreenPassScope(bool a_screenPass) { nativeScreenPass = a_screenPass; }
+				~ScreenPassScope() { nativeScreenPass = previous; }
+			} screenPass(enabled && !rendering && a_postAA && a_target == 0);
 			if (!enabled || !ENBRenderDomain::Get().Active() || rendering) {
 				func(a_target, a_postAA);
 				return;
@@ -402,15 +435,19 @@ void NativeInterfaceUI::ReleaseResources()
 	renderedModelCount = 0;
 }
 
-void NativeInterfaceUI::InstallHooks()
+void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 {
 	const auto isOG = REX::FModule::IsRuntimeOG();
-	const auto create = stl::detour_thunk_gateway<CreateTarget>(REL::ID{ 43433, 2277176 }, isOG ? 5 : 6, "Interface3D native target allocation");
-	const auto color = stl::detour_thunk_gateway<SetColor>(REL::ID{ 1502425, 2277188 }, isOG ? 6 : 5, "Interface3D color target tracking");
-	const auto depth = InstallDepthHook();
+	bool nativeHooksReady = true;
+	if (a_nativeDomains) {
+		const auto create = stl::detour_thunk_gateway<CreateTarget>(REL::ID{ 43433, 2277176 }, isOG ? 5 : 6, "Interface3D native target allocation");
+		const auto color = stl::detour_thunk_gateway<SetColor>(REL::ID{ 1502425, 2277188 }, isOG ? 6 : 5, "Interface3D color target tracking");
+		const auto depth = InstallDepthHook();
+		nativeHooksReady = create && color && depth;
+	}
 	// Hook the worker, not RenderPostAA's MOV DL,1 / relative tail jump.
 	const auto render = stl::detour_thunk_gateway<RenderAll>(REL::ID{ 1030129, 2222565 }, 8, "Interface3D native post-AA UI");
-	enabled = create && color && depth && render;
+	enabled = nativeHooksReady && render;
 	const auto renderAll = REL::ID{ 1030129, 2222565 }.address();
 	const auto prepassCall = renderAll + (isOG ? 0x92 : 0x145);
 	const auto mainCall = renderAll + (isOG ? 0x9D : 0x150);

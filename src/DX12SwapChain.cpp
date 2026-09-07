@@ -1558,6 +1558,47 @@ std::shared_ptr<D3D11D3D12SharedTexture> DX12SwapChain::CaptureScreenshot()
 	}
 }
 
+bool DX12SwapChain::PrepareNativeUIForEngineComposition()
+{
+	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive) {
+		return false;
+	}
+	if (nativeUIIncludesScene) {
+		return true;
+	}
+	if (!presentOverrideFinalColor) {
+		return false;  // No split D3D12 world/D3D11 UI to resolve.
+	}
+	// The existing menu resolve uses GPU-side waits for the interop transfers. Preserve
+	// OM bindings because this entry point runs inside the engine render loop.
+	struct RestoreTargets
+	{
+		ID3D11DeviceContext* context;
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> views{};
+		std::array<winrt::com_ptr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> retained;
+		winrt::com_ptr<ID3D11DepthStencilView> depth;
+		explicit RestoreTargets(ID3D11DeviceContext* a_context) : context(a_context)
+		{
+			context->OMGetRenderTargets(static_cast<UINT>(views.size()), views.data(), depth.put());
+			for (size_t i = 0; i < views.size(); ++i) {
+				retained[i].attach(views[i]);
+			}
+			context->OMSetRenderTargets(0, nullptr, nullptr);
+		}
+		~RestoreTargets()
+		{
+			context->OMSetRenderTargets(static_cast<UINT>(views.size()), views.data(), depth.get());
+		}
+	} restore(d3d11Context.get());
+	try {
+		ResolveNativeUIForMenu();
+	} catch (const std::exception& e) {
+		logger::error("[UI composite] Engine menu composition failed: {}", e.what());
+		return false;
+	}
+	return nativeUIIncludesScene;
+}
+
 void DX12SwapChain::ResolveNativeUIForMenu()
 {
 	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive ||
@@ -1567,8 +1608,9 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	auto* uiTarget = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
 		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
 	if (!uiTarget) { return; }
-	// Resolve a complete frame for menu background filters, or before ScopeMenu
-	// draws its black surround. Normal gameplay keeps the split UI path.
+	// Resolve a complete frame before destination-dependent HUDGlass menus,
+	// menu background filters or ScopeMenu's black surround. Normal gameplay
+	// keeps the split UI path. nativeUIIncludesScene deduplicates every caller.
 	if (!menuComposite) {
 		D3D11_TEXTURE2D_DESC desc{};
 		uiTarget->GetDesc(&desc);
@@ -1729,14 +1771,6 @@ void main(uint3 p : SV_DispatchThreadID)
 		manager->renderTargetData[0].width = swapChainDesc.Width;
 		manager->renderTargetData[0].height = swapChainDesc.Height;
 		nativeUIActive = true;
-		if (Upscaling::GetSingleton()->scopeMenuOpen && presentOverrideFinalColor) {
-			// Seed the native target before Interface3D/Scaleform draws the scope.
-			// Its black surround then covers world RGB directly, even when an
-			// engine composition pass does not write alpha. Present recognizes
-			// nativeUIIncludesScene and copies the completed frame only once.
-			d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
-			ResolveNativeUIForMenu();
-		}
 		auto* rtv = nativeUITexture->rtv.get();
 		d3d11Context->OMSetRenderTargets(1, &rtv, nullptr);
 		using SetViewport = void (*)(RE::BSGraphics::RenderTargetManager*);

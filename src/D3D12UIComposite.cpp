@@ -139,12 +139,8 @@ float4 PSMain(PSInput input) : SV_TARGET
 {
 	const float4 base = baseColor.Sample(linearSampler, input.uv);
 	const float4 afterUI = postUI.Sample(pointSampler, input.uv);
-	const float rgbMax = max(afterUI.r, max(afterUI.g, afterUI.b));
-	const float luma = dot(afterUI.rgb, float3(0.2126f, 0.7152f, 0.0722f));
-	const float coverage = max(afterUI.a, max(rgbMax, luma));
-	const float alpha = coverage > 0.01f ? saturate(coverage) : 0.0f;
-	const float3 uiColor = saturate(afterUI.rgb);
-	return float4(lerp(base.rgb, uiColor, alpha), 1.0f);
+	// UI RGB already contains source alpha from rendering into the transparent target.
+	return float4(afterUI.rgb + base.rgb * (1.0f - saturate(afterUI.a)), 1.0f);
 }
 )";
 		auto vertexShader = CompileShader(shaderSource, "VSMain", "vs_5_0");
