@@ -1806,6 +1806,9 @@ void Upscaling::LoadSettings()
 	settings.dlssModelPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iDLSSModelPreset", 0), 0, 4));
 	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 1) == 1);
 	settings.dlssNRPassCount = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPassCount", 1), 1, 3));
+	settings.vsyncMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Presentation", "iVSyncMode", 0), 0, 2));
+	const auto outputLimit = ini.GetLongValue("Presentation", "iOutputFPSLimit", 0);
+	settings.outputFPSLimit = outputLimit <= 0 ? 0u : static_cast<uint>(std::clamp<long>(outputLimit, 10, 500));
 	settings.dlssNRPerformanceMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPerformanceMode", 0), 0, 5));
 	settings.dlssNRPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPreset", 0), 0, 3));
 	settings.dlssNRStyle = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iStyle", 0), 0, 2));
@@ -1897,6 +1900,8 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 
 	ini.SetLongValue("DLSSNR", "bEnabled", static_cast<long>(a_settings.dlssNREnabled));
 	ini.SetLongValue("DLSSNR", "iPassCount", static_cast<long>(std::clamp(a_settings.dlssNRPassCount, 1u, 3u)));
+	ini.SetLongValue("Presentation", "iVSyncMode", static_cast<long>(std::min(a_settings.vsyncMode, 2u)));
+	ini.SetLongValue("Presentation", "iOutputFPSLimit", a_settings.outputFPSLimit == 0 ? 0L : static_cast<long>(std::clamp(a_settings.outputFPSLimit, 10u, 500u)));
 	ini.SetLongValue("DLSSNR", "iPerformanceMode", static_cast<long>(a_settings.dlssNRPerformanceMode));
 	ini.SetLongValue("DLSSNR", "iPreset", static_cast<long>(a_settings.dlssNRPreset));
 	ini.SetLongValue("DLSSNR", "iStyle", static_cast<long>(a_settings.dlssNRStyle));

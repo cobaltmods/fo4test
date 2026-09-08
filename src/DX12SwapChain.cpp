@@ -641,6 +641,7 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_str
 
 void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWAP_CHAIN_DESC& a_swapChainDesc, Streamline* a_streamline, bool a_useFidelityFXFrameGeneration)
 {
+	presentPacing.Reset();
 	hwnd = a_swapChainDesc.OutputWindow;
 	BOOL allowTearing = FALSE;
 	std::ignore = a_dxgiFactory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
@@ -1018,6 +1019,7 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 
 HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask)
 {
+	presentPacing.Reset();
 	// ENB's outer wrapper still needs its ResizeBuffers notification, but a
 	// quality-only transaction must never reach the real display swapchain.
 	if (sceneResizeActive) {
@@ -1098,6 +1100,7 @@ HRESULT DX12SwapChain::ResizeBuffers1(UINT, UINT a_width, UINT a_height, DXGI_FO
 
 HRESULT DX12SwapChain::SetFullscreenState(BOOL a_fullscreen, IDXGIOutput* a_target)
 {
+	presentPacing.Reset();
 	if (!swapChain || deviceLost) {
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
@@ -1261,6 +1264,20 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 #ifdef UPSCALING_NR_CAPTURE
 	NRDiagnosticCapture::Submitted(a_context.list.get(), commandFence.get(), signalValue);
 #endif
+}
+
+void DX12SwapChain::PaceFrameStart(uint32_t frame)
+{
+	if (!IsReady() || deviceLost || IsWindowUnavailable()) {
+		presentPacing.Reset();
+		return;
+	}
+	const auto* streamline = Streamline::GetSingleton();
+	const auto multiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
+		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
+	// Main::OnIdle is the pre-input entry; Renderer::Begin handles standalone
+	// loading/movie draws. The same frame reaching both must only wait once.
+	presentPacing.WaitForFrame(frame, Upscaling::GetSingleton()->settings.outputFPSLimit, multiplier, hwnd);
 }
 
 void DX12SwapChain::WaitForFrameStart()
@@ -1834,10 +1851,12 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	if (deviceLost) {
 		ReShadeDepth::Invalidate();
+		presentPacing.Reset();
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
 	if (!IsReady()) {
 		ReShadeDepth::Invalidate();
+		presentPacing.Reset();
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
@@ -1854,6 +1873,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
 		ReShadeDepth::Invalidate();
+		presentPacing.Reset();
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
 		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
@@ -2024,14 +2044,39 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		nativeUIReadFenceValue = commandContext.fenceValue;
 	}
 
-	const auto fidelityFXFrameGenerationActive = upscaling->IsFSRFrameGenerationActive();
-	const auto presentSyncInterval = (dlssgPresentSafety || fidelityFXFrameGenerationActive) ? 0u : SyncInterval;
-	const auto presentFlags = dlssgPresentSafety ? (Flags & ~DXGI_PRESENT_ALLOW_TEARING) : Flags;
+	const auto vsyncMode = upscaling->settings.vsyncMode;
+	UINT presentSyncInterval = vsyncMode == 2 ? 1u : vsyncMode == 1 ? 0u : SyncInterval;
+	// FSR propagates SyncInterval to its generated-frame pacing thread.
+	if (dlssgPresentSafety) {
+		presentSyncInterval = streamline->SupportsDLSSGVSync() ? std::min(presentSyncInterval, 1u) : 0u;
+	}
+	UINT presentFlags = Flags & ~DXGI_PRESENT_ALLOW_TEARING;
+	BOOL fullscreen = FALSE;
+	const bool knownWindowed = SUCCEEDED(swapChain->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen;
+	if (presentSyncInterval == 0 && knownWindowed && (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) &&
+		!dlssgPresentSafety && (vsyncMode == 1 || (Flags & DXGI_PRESENT_ALLOW_TEARING))) {
+		presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+	}
+	// Diagnostic only: pacing happens before simulation/input, never here.
+	const auto pacingMultiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
+		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
+	static uint32_t loggedMode = UINT32_MAX, loggedCap = UINT32_MAX, loggedMultiplier = 0, loggedSync = UINT32_MAX;
+	if (loggedMode != vsyncMode || loggedCap != upscaling->settings.outputFPSLimit ||
+		loggedMultiplier != pacingMultiplier || loggedSync != presentSyncInterval) {
+		logger::info("[Presentation] vsyncMode={} sync={} outputLimit={} multiplier={} applicationLimit={:.2f} Reflex-independent",
+			vsyncMode, presentSyncInterval, upscaling->settings.outputFPSLimit, pacingMultiplier,
+			static_cast<double>(upscaling->settings.outputFPSLimit) / pacingMultiplier);
+		loggedMode = vsyncMode;
+		loggedCap = upscaling->settings.outputFPSLimit;
+		loggedMultiplier = pacingMultiplier;
+		loggedSync = presentSyncInterval;
+	}
 	const auto emitPresentMarkers = streamline->NeedsPresentMarkers();
 	if (emitPresentMarkers) {
 		streamline->OnPresentStart();
 	}
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
+	if (result != S_OK) { presentPacing.Reset(); }
 	ReShadeDepth::EndPresent();
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);

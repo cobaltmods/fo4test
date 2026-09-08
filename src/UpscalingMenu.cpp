@@ -7,7 +7,6 @@
 #include <atomic>
 #include "Streamline.h"
 #include "Upscaling.h"
-#include "ENBRenderDomain.h"
 
 #include <array>
 #include <mutex>
@@ -337,11 +336,6 @@ namespace
 		bool changed = false;
 
 		ImGuiMCP::TextWrapped("Changes are saved and applied when the F4SE Menu Framework closes.");
-		if (ENBRenderDomain::Get().Active()) {
-			ImGuiMCP::TextWrapped("Resolution quality changes apply live after outstanding frames drain. Only scene/game/ENB buffers are resized; the window, real display swapchain and native UI target remain unchanged.");
-			ImGuiMCP::TextDisabled("Active ENB scene: %u x %u (active quality %u)",
-				ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height(), ENBRenderDomain::Get().Quality());
-		}
 		const auto streamline = Streamline::GetSingleton();
 		if (streamline->initialized) {
 			ImGuiMCP::TextDisabled(
@@ -374,7 +368,17 @@ namespace
 			"%.2f",
 			"Controls NVIDIA Image Scaling sharpen for DLSS and RCAS for FSR.");
 
-		ImGuiMCP::SeparatorText("Frame Generation and Latency");
+		const bool dlssSelected = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDLSS);
+		if (dlssSelected) {
+			static constexpr std::array dlssPresets{ "Recommended", "Default", "K", "M", "L" };
+			changed |= ComboSetting(
+				"DLSS Model Preset",
+				settings.dlssModelPreset,
+				dlssPresets,
+				"Recommended uses K for DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.");
+		}
+
+		ImGuiMCP::SeparatorText("Frame Generation");
 		const bool upscalingDisabled = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled);
 		ImGuiMCP::BeginDisabled(upscalingDisabled);
 		static constexpr std::array frameGenerationModes{ "Disabled", "On", "Auto" };
@@ -386,7 +390,6 @@ namespace
 		ImGuiMCP::EndDisabled();
 
 		const bool frameGenerationDisabled = upscalingDisabled || settings.frameGenerationMode == 0;
-		const bool dlssSelected = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDLSS);
 		ImGuiMCP::BeginDisabled(frameGenerationDisabled || !dlssSelected);
 		static constexpr std::array generatedFrameCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)" };
 		changed |= ComboSetting(
@@ -416,14 +419,15 @@ namespace
 			reflexModes,
 			"Controls NVIDIA Reflex low-latency mode. Frame generation forces at least On while active.");
 
-		ImGuiMCP::SeparatorText("DLSS");
+		ImGuiMCP::SeparatorText("FPS Limiter");
+		static constexpr std::array vsyncModes{ "Game setting", "Off", "On" };
+		changed |= ComboSetting("VSync", settings.vsyncMode, vsyncModes,
+			"D3D12 output VSync, including FG. On disables DLSS-G if its runtime does not support VSync. Driver overrides still apply.");
+		changed |= SliderIntSetting("Output FPS Limit", settings.outputFPSLimit, 0, 500, "%d FPS",
+			"Reflex-independent frame-start pacing for D3D12 output. 0 disables; values below 10 become 10. Includes FG. Dynamic MFG uses its maximum multiplier conservatively and may run below the target. A cap alone does not prevent tearing; use VSync/VRR.");
+
+		ImGuiMCP::SeparatorText("DLSS NR");
 		ImGuiMCP::BeginDisabled(!dlssSelected);
-		static constexpr std::array dlssPresets{ "Recommended", "Default", "K", "M", "L" };
-		changed |= ComboSetting(
-			"Model Preset",
-			settings.dlssModelPreset,
-			dlssPresets,
-			"Recommended uses K for DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.");
 
 		changed |= CheckboxSetting(
 			"DLSS Neural Rendering",
@@ -471,7 +475,6 @@ namespace
 		ImGuiMCP::Text("%s", NRDiagnosticCapture::Status().c_str());
 #endif
 
-		ImGuiMCP::SeparatorText("Hotkeys");
 		ImGuiMCP::BeginDisabled(g_dlssNRHotkeyHandle < 0);
 		HotkeySetting(
 			"DLSS NR Toggle Hotkey",
@@ -484,6 +487,7 @@ namespace
 			ImGuiMCP::TextDisabled("Hotkey binding requires a F4SE Menu Framework version with the plugin hotkey API.");
 		}
 
+		ImGuiMCP::SeparatorText("OSD");
 		static constexpr std::array osdModes{ "Disabled", "Compact", "Detailed" };
 		changed |= ComboSetting(
 			"On-Screen Display",
@@ -524,7 +528,7 @@ void UpscalingMenu::Register()
 	}
 
 	// Scan code 0 intentionally leaves the action unbound until the player uses
-	// the capture button in Upscaling's Hotkeys section.
+	// the binding button in Upscaling's DLSS NR section.
 	g_dlssNRHotkeyHandle = F4SEMenuFramework::Hotkeys::Register(kDLSSNRHotkeyID, 0, OnToggleDLSSNRHotkey);
 	if (g_dlssNRHotkeyHandle < 0) {
 		logger::warn("[Menu] F4SE Menu Framework did not expose the plugin hotkey API; DLSS-NR hotkey is unavailable");

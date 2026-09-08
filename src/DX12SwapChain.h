@@ -1,4 +1,5 @@
 #pragma once
+#include "PresentPacing.h"
 
 #include <atomic>
 
@@ -96,6 +97,7 @@ public:
 
 	DXGISwapChainProxy* GetSwapChainProxy() const { return swapChainProxy; }
 	bool IsReady() const { return swapChainProxy && swapChain && interopReady; }
+	void PaceFrameStart(uint32_t frame);
 	bool IsWindowMinimized() const { return windowMinimized.load(std::memory_order_acquire) || (hwnd && IsIconic(hwnd)); }
 	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
 	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
@@ -229,6 +231,7 @@ private:
 	std::array<uint64_t, kDX12FrameCount> reshadeSnapshotFrames{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
+	PresentPacing presentPacing;
 	HWND hwnd = nullptr;
 	WNDPROC originalWndProc = nullptr;
 	std::atomic_bool windowMinimized{ false };

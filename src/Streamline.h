@@ -157,6 +157,8 @@ public:
 	 */
 	void UpdateReflex(uint a_reflexMode, bool a_forceEnabled);
 	void BeginRenderFrame(uint32_t a_frameIndex);
+	bool SupportsDLSSGVSync() const { return dlssgVSyncSupported; }
+	uint32_t GetDLSSGPacingMultiplier() const;
 	bool BeginSimulationFrame(uint32_t a_frameIndex);
 	void EndSimulationFrame(uint32_t a_frameIndex);
 
@@ -344,6 +346,7 @@ private:
 	bool pclLatencyReportAvailable = false;
 	bool pendingDLSSGDisable = false;
 	uint32_t dlssgPresentSafetyFrames = 0;
+	bool dlssgVSyncSupported = false;
 	bool loggedDLSSNRFallback = false;
 	bool loggedNativeDLSSNRMultipass = false;
 	bool dlssNRSuspended = false;

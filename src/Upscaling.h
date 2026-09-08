@@ -91,6 +91,8 @@ public:
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
 		uint dlssNREnabled = 1;                                     ///< Prefer DLSS-NR uplift over DLSS SR when available
 		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
+		uint vsyncMode = 0;                                        ///< 0=game, 1=off, 2=on
+		uint outputFPSLimit = 0;                                   ///< FG-inclusive target, 0=unlimited, otherwise 10..500
 		uint dlssNRPerformanceMode = 0;                             ///< 0=Follow quality mode, 1..4=NGX modes, 5=DLAA
 		uint dlssNRPreset = 0;                                      ///< DLSS-NR preset: 0=Default, 1..3=preview presets
 		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic

@@ -336,6 +336,7 @@ void Streamline::Shutdown()
 	swapChainDesc = {};
 	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
 	constantsTokenIndex = std::numeric_limits<uint32_t>::max();
+	dlssgVSyncSupported = false;
 	lastConstantsFrameIndex = std::numeric_limits<uint32_t>::max();
 	lastTemporalResetFrameIndex = std::numeric_limits<uint32_t>::max();
 	constantsReferenceCamera = nullptr;
@@ -563,6 +564,8 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 
 bool Streamline::PaceFrame(uint32_t a_frameIndex)
 {
+	// Before Reflex Sleep and input markers, even without Streamline/Reflex.
+	DX12SwapChain::GetSingleton()->PaceFrameStart(a_frameIndex);
 	const auto* upscaling = Upscaling::GetSingleton();
 	const bool validToken = EnsureFrameToken(a_frameIndex);
 	if (!validToken || reflexSleepFrame == a_frameIndex) {
@@ -615,6 +618,14 @@ void Streamline::RequestTemporalReset()
 	// is consumed by UpdateConstants on the next frame, never by republishing.
 	temporalResetPending = true;
 	directDLSSNR.RequestReset();
+}
+
+uint32_t Streamline::GetDLSSGPacingMultiplier() const
+{
+	if (!dlssgActive) { return 1; }
+	// ActuallyPresented accumulates across state queries, not a per-frame multiplier.
+	const auto generated = currentDLSSGMode == sl::DLSSGMode::eDynamic ? maxFramesToGenerate : currentDLSSGGeneratedFrames;
+	return 1u + std::clamp(generated, 1u, 5u);
 }
 
 bool Streamline::ValidateConstantsForFrame(sl::FrameToken* a_frameToken)
@@ -751,6 +762,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		sl::DLSSGState state{};
 		if (SL_SUCCEEDED(result, slDLSSGGetState(viewport, state, nullptr))) {
 			maxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
+			dlssgVSyncSupported = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
 			dynamicMFGSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
 		}
 		dlssgStateKnown = !restrictAdaToNativeTwoX;
@@ -764,6 +776,18 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	}
 
 	const bool hasSizes = a_renderSize.x > 0.0f && a_renderSize.y > 0.0f && a_displaySize.x > 0.0f && a_displaySize.y > 0.0f;
+	// Old DLSS-G runtimes cannot honor application VSync. Prefer the user's
+	// explicit tear-free policy over enabling an incompatible FG configuration.
+	static bool loggedVSyncFallback = false;
+	if (a_enabled && Upscaling::GetSingleton()->settings.vsyncMode == 2 && !dlssgVSyncSupported) {
+		if (!loggedVSyncFallback) {
+			logger::warn("[Presentation] DLSS-G runtime has no application VSync support; FG disabled while VSync On is selected");
+		}
+		loggedVSyncFallback = true;
+		RequestDLSSGDisable();
+		return true;
+	}
+	loggedVSyncFallback = false;
 	sl::DLSSGMode mode = sl::DLSSGMode::eOff;
 	if (a_enabled && hasSizes) {
 		if (a_dynamicMFGEnabled || a_mode == 3) {
@@ -788,7 +812,9 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	const uint32_t displayWidth = hasSizes ? static_cast<uint32_t>(a_displaySize.x) : 0;
 	const uint32_t displayHeight = hasSizes ? static_cast<uint32_t>(a_displaySize.y) : 0;
 	const uint32_t generatedFrames = std::clamp<uint32_t>(a_numFramesToGenerate, 1, std::max<uint32_t>(1, maxFramesToGenerate));
-	const uint32_t dynamicTargetFPS = mode == sl::DLSSGMode::eDynamic ? a_dynamicMFGTargetFPS : 0;
+	const auto outputLimit = Upscaling::GetSingleton()->settings.outputFPSLimit;
+	const auto targetFPS = outputLimit ? (a_dynamicMFGTargetFPS ? std::min(a_dynamicMFGTargetFPS, outputLimit) : outputLimit) : a_dynamicMFGTargetFPS;
+	const uint32_t dynamicTargetFPS = mode == sl::DLSSGMode::eDynamic ? targetFPS : 0;
 
 	static uint32_t currentRenderWidth = 0;
 	static uint32_t currentRenderHeight = 0;
@@ -1094,6 +1120,7 @@ void Streamline::QueryDLSSGState(std::string_view a_phase)
 		return;
 	}
 	lastDLSSGPresentMultiplier = static_cast<double>(state.numFramesActuallyPresented);
+	dlssgVSyncSupported = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
 
 	maxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
 	if (RTX40MFGUnlock::AdaAdapterVerified()) {
