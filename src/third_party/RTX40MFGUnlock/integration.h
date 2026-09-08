@@ -1,5 +1,8 @@
 #pragma once
 
+#include <Windows.h>
+#include <cstdint>
+
 struct ID3D12Device;
 
 namespace RTX40MFGUnlock
@@ -14,4 +17,8 @@ namespace RTX40MFGUnlock
 
 	bool AdaAdapterVerified() noexcept;
 	bool Ready() noexcept;
+	void InstallLoaderDiscovery(HMODULE a_module) noexcept;
+	void InspectLoadedModule(HMODULE a_module) noexcept;
+	void ObserveWrapper(const void* a_function) noexcept;
+	std::uint32_t MaximumGeneratedFrames() noexcept;
 }

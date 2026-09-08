@@ -4,7 +4,7 @@ This directory contains code derived from Michael Robles' **RTX40MFG-Unlock**
 project:
 
 - Upstream repository: <https://github.com/dashdogy/RTX40MFG-Unlock>
-- Imported revision: `4ab7b5e16941e065f81c665b6d7fe2c2e2ec843f`
+- Imported revision: **v1.2**, `767b9e916023a2a2157dacdd40c22deeaad1aac9`
 - Upstream license: MIT; see [LICENSE](LICENSE)
 
 Credit for the DLSS-G wrapper/NGX patch signatures, provider validation, and
@@ -12,18 +12,44 @@ Ada midpoint correction belongs to the RTX40MFG-Unlock project and its author.
 
 ## Local adaptation
 
-`midpoint_fix.*` and `dlssg_provider_policy.*` are vendored from the upstream
-revision. `integration.*` adapts the relevant module discovery and fail-closed
-pattern patching from upstream `patcher.cpp` to this Fallout 4 F4SE plugin.
+`midpoint_fix.*`, `dlssg_provider_policy.*`, and `universal_wrapper_profile.h`
+are vendored without source changes (apart from line endings) from that revision.
+This includes the validated 310.1–310.9 provider profiles, payload/layout checks,
+DLSS-G versus DirectSR identity checks, and 1/3/5 generated-frame wrapper limits.
+`integration.*` and `loader_discovery.cpp` adapt discovery and fail-closed pattern
+patching from upstream `patcher.cpp` to this Fallout 4 F4SE plugin.
 
-The upstream Cyber Engine Tweaks UI, configuration/status IPC, worker thread,
+The upstream standalone/ReShade UI, configuration/status IPC, worker thread,
 `DllMain`, executable IAT hooks, FPS telemetry, and Streamline tag interception
 are intentionally excluded. This plugin already owns the Streamline function
 pointers, DLSS-G options, state queries, and HUD-less/UI resource tags directly.
 
-The adapted integration runs after Streamline loads its feature modules and is
-retried after creation of the active D3D12 device. Provider versions and binary
-layouts which are not explicitly recognized fail closed without being patched.
+Loader-return IAT discovery starts before `slInit` and follows NVIDIA modules,
+including opaque-name Streamline plugins. It inspects newly loaded providers
+before the loader returns to its caller, and retries after D3D12 device creation.
+The original import is published before replacing its IAT slot; conflicting
+import chains are left unchanged. Data-file handles are ignored and Win32 last
+error is preserved. This is not a process-wide loader hook or DLL notification.
+
+The actual `slDLSSGSetOptions` function obtained by our host selects the active
+wrapper, rather than an arbitrary patched module. Its compiled maximum also
+caps the advertised state. Inspected plugin/provider DLL references are retained
+for plugin lifetime to prevent cached patch pointers from becoming stale.
+
+Unlike upstream's standalone backend, this host adaptation does not install
+NGX CreateFeature entry/resolver detours or its Vulkan/control-route machinery.
+Provider readiness therefore requires exactly one discovered implementation;
+multiple providers fail closed to 2X, rather than guessing which is active.
+This intentionally does not claim full upstream multi-provider routing support.
+
+`Streamline::Initialize` clears both `eAllowOTA` and `eLoadDownloadedPlugins`.
+Upstream's conditional OTA-enabling and selective-wrapper redirect policies
+are intentionally not imported. These SDK flags are not a guarantee against
+independent NVIDIA App/driver profile overrides.
+
+Unknown or ambiguous wrapper patterns and unverified midpoint layouts fail
+closed. The upstream NGX device-support signature patch is independent of the
+stricter midpoint provider version/payload validation.
 All wrapper, NGX, and midpoint patches are gated on the upstream CUDA compute
 capability 8.9 check, so they remain inactive on non-Ada adapters. This includes
 RTX 40-series GPUs and can also include Ada-based professional GPUs; it is not a

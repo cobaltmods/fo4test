@@ -266,6 +266,9 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 	pref.projectId = "f8776929-c969-43bd-ac2b-294b4de58aac";
 	pref.flags |= sl::PreferenceFlags::eUseManualHooking;
 	pref.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+	pref.flags &= ~(sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins);
+	logger::info("[Streamline] OTA downloads and downloaded plugin loading disabled");
+	RTX40MFGUnlock::InstallLoaderDiscovery(interposer);
 
 	pref.renderAPI = a_renderAPI;
 
@@ -488,6 +491,7 @@ void Streamline::PostDevice()
 	if (featureDLSSG) {
 		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState);
 		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
+		RTX40MFGUnlock::ObserveWrapper(reinterpret_cast<const void*>(slDLSSGSetOptions));
 	}
 
 	if (featureReflex) {
@@ -738,6 +742,9 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	if (restrictAdaToNativeTwoX) {
 		maxFramesToGenerate = 1;
 		dynamicMFGSupported = false;
+	}
+	if (RTX40MFGUnlock::AdaAdapterVerified()) {
+		maxFramesToGenerate = std::min(maxFramesToGenerate, RTX40MFGUnlock::MaximumGeneratedFrames());
 	}
 
 	const bool hasSizes = a_renderSize.x > 0.0f && a_renderSize.y > 0.0f && a_displaySize.x > 0.0f && a_displaySize.y > 0.0f;
@@ -1073,6 +1080,9 @@ void Streamline::QueryDLSSGState(std::string_view a_phase)
 	lastDLSSGPresentMultiplier = static_cast<double>(state.numFramesActuallyPresented);
 
 	maxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
+	if (RTX40MFGUnlock::AdaAdapterVerified()) {
+		maxFramesToGenerate = std::min(maxFramesToGenerate, RTX40MFGUnlock::MaximumGeneratedFrames());
+	}
 	dynamicMFGSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
 	dlssgStateKnown = true;
 

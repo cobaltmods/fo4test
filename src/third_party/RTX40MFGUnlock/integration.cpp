@@ -5,6 +5,7 @@
 
 #include "dlssg_provider_policy.h"
 #include "midpoint_fix.h"
+#include "universal_wrapper_profile.h"
 
 #include <TlHelp32.h>
 
@@ -21,6 +22,13 @@ namespace RTX40MFGUnlock
 {
 	namespace
 	{
+		static_assert(universal_wrapper_profile::SafeMaximumMultiplier(1) == 2);
+		static_assert(universal_wrapper_profile::SafeMaximumMultiplier(3) == 4);
+		static_assert(universal_wrapper_profile::SafeMaximumMultiplier(5) == 6);
+		static_assert(universal_wrapper_profile::SafeMaximumMultiplier(7) == 2);
+		static_assert(universal_wrapper_profile::ClampMultiplier(6, 3) == 4);
+		static_assert(universal_wrapper_profile::ClampMultiplier(0, 5) == 2);
+
 		struct PatternPatch
 		{
 			const char* label;
@@ -44,6 +52,7 @@ namespace RTX40MFGUnlock
 			HMODULE module = nullptr;
 			bool wrapper = false;
 			bool wrapperPatched = false;
+			std::uint32_t compiledMaximum = 0;
 			bool ngx = false;
 			bool ngxPatched = false;
 			bool midpointPatched = false;
@@ -79,7 +88,8 @@ namespace RTX40MFGUnlock
 			kNgxOriginal.size()
 		};
 
-		std::mutex g_mutex;
+		std::recursive_mutex g_mutex;
+		HMODULE g_activeWrapper = nullptr;
 		std::vector<ModuleRecord> g_modules;
 		bool g_midpointLogConnected = false;
 
@@ -215,7 +225,9 @@ namespace RTX40MFGUnlock
 					const bool patchBytesMatch =
 						std::memcmp(candidate, a_patch.original, a_patch.patchSize) == 0 ||
 						std::memcmp(candidate, a_patch.replacement, a_patch.patchSize) == 0;
-					if (prefixMatches && suffixMatches && patchBytesMatch) {
+					if ((&a_patch == &kWrapperPatch)
+						? universal_wrapper_profile::Matches(begin + offset, size - offset)
+						: (prefixMatches && suffixMatches && patchBytesMatch)) {
 						match = begin + offset;
 						++matchCount;
 					}
@@ -286,9 +298,11 @@ namespace RTX40MFGUnlock
 			if (record.wrapper) {
 				const auto result = PatchUniqueExecutablePattern(a_module, path, kWrapperPatch);
 				record.wrapperPatched = result.patched;
-				if (!result.candidate) {
-					logger::warn("[RTX40MFGUnlock] Streamline wrapper signature is unsupported: {}", Narrow(path.c_str()));
+				if (result.patched) {
+					std::memcpy(&record.compiledMaximum, result.match + universal_wrapper_profile::kMaximumOffset, sizeof(record.compiledMaximum));
 				}
+				// Generic Streamline plugins share this export. Only the active
+				// DLSS-G route is required to have a supported wrapper signature.
 			}
 			if (record.ngx) {
 				const auto result = PatchUniqueExecutablePattern(a_module, path, kNgxPatch);
@@ -325,31 +339,13 @@ namespace RTX40MFGUnlock
 			entry.dwSize = sizeof(entry);
 			if (Module32FirstW(snapshot, &entry)) {
 				do {
-					const auto module = reinterpret_cast<HMODULE>(entry.modBaseAddr);
-					auto existing = std::find_if(g_modules.begin(), g_modules.end(), [module](const ModuleRecord& a_record) {
-						return a_record.module == module;
-					});
-					if (existing == g_modules.end()) {
-						auto record = InspectModule(module);
-						if (record.wrapper || record.ngx) {
-							g_modules.push_back(record);
-						}
-					} else if (existing->ngxPatched && !existing->midpointPatched && midpoint_fix::AdapterVerified()) {
-						const auto path = LoadedModulePath(module);
-						existing->midpointPatched = midpoint_fix::PatchProvider(module, path.c_str());
-					}
+					InspectLoadedModule(reinterpret_cast<HMODULE>(entry.modBaseAddr));
 					entry.dwSize = sizeof(entry);
 				} while (Module32NextW(snapshot, &entry));
 			}
 			CloseHandle(snapshot);
 
-			const auto wrapperReady = std::any_of(g_modules.begin(), g_modules.end(), [](const ModuleRecord& a_record) {
-				return a_record.wrapperPatched;
-			});
-			const auto ngxReady = std::any_of(g_modules.begin(), g_modules.end(), [](const ModuleRecord& a_record) {
-				return a_record.ngxPatched;
-			});
-			return wrapperReady && ngxReady && midpoint_fix::Ready();
+			return Ready();
 		}
 	}
 
@@ -379,15 +375,81 @@ namespace RTX40MFGUnlock
 		return midpoint_fix::AdapterVerified();
 	}
 
+	void InspectLoadedModule(HMODULE a_module) noexcept
+	{
+		// Retain inspected code: cached patch addresses and upstream PTX descriptors
+		// must not outlive their DLL. Only relevant modules keep this reference.
+		if (!a_module || (reinterpret_cast<std::uintptr_t>(a_module) & 3)) {
+			return;
+		}
+		HMODULE retained = nullptr;
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+			reinterpret_cast<LPCWSTR>(a_module), &retained)) {
+			return;
+		}
+		try {
+			InstallLoaderDiscovery(retained);
+			std::lock_guard lock(g_mutex);
+			if (midpoint_fix::AdapterVerified()) {
+				auto existing = std::find_if(g_modules.begin(), g_modules.end(),
+					[retained](const ModuleRecord& record) { return record.module == retained; });
+				if (existing == g_modules.end()) {
+					auto record = InspectModule(retained);
+					if (record.wrapper || record.ngx) {
+						g_modules.push_back(record);
+						retained = nullptr; // Deliberately held for plugin lifetime.
+					}
+				} else if (existing->ngxPatched && !existing->midpointPatched) {
+					existing->midpointPatched = midpoint_fix::PatchProvider(retained, LoadedModulePath(retained).c_str());
+				}
+			}
+		} catch (...) {
+			logger::warn("[RTX40MFGUnlock] Loaded module inspection failed");
+		}
+		if (retained) {
+			FreeLibrary(retained);
+		}
+	}
+
+	void ObserveWrapper(const void* a_function) noexcept
+	{
+		HMODULE module = nullptr;
+		if (a_function && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+			reinterpret_cast<LPCWSTR>(a_function), &module)) {
+			InspectLoadedModule(module);
+			{
+				std::lock_guard lock(g_mutex);
+				g_activeWrapper = module;
+			}
+			logger::info("[RTX40MFGUnlock] Active DLSS-G wrapper: {}", Narrow(LoadedModulePath(module).c_str()));
+			FreeLibrary(module);
+		}
+	}
+
 	bool Ready() noexcept
 	{
 		std::lock_guard lock(g_mutex);
-		const auto wrapperReady = std::any_of(g_modules.begin(), g_modules.end(), [](const ModuleRecord& a_record) {
-			return a_record.wrapperPatched;
-		});
-		const auto ngxReady = std::any_of(g_modules.begin(), g_modules.end(), [](const ModuleRecord& a_record) {
-			return a_record.ngxPatched;
-		});
-		return wrapperReady && ngxReady && midpoint_fix::Ready();
+		const auto wrapper = std::find_if(g_modules.begin(), g_modules.end(),
+			[](const ModuleRecord& record) { return record.module == g_activeWrapper; });
+		// Never combine a patched inactive wrapper with an unrelated provider.
+		// Multiple providers are ambiguous without an observed dispatch route.
+		const auto providers = std::count_if(g_modules.begin(), g_modules.end(),
+			[](const ModuleRecord& record) { return record.ngx; });
+		const auto provider = std::find_if(g_modules.begin(), g_modules.end(),
+			[](const ModuleRecord& record) { return record.ngx; });
+		return midpoint_fix::AdapterVerified() && wrapper != g_modules.end() &&
+			wrapper->wrapperPatched && providers == 1 &&
+			provider->ngxPatched && provider->midpointPatched;
+	}
+
+	std::uint32_t MaximumGeneratedFrames() noexcept
+	{
+		std::lock_guard lock(g_mutex);
+		if (!Ready()) {
+			return 1;
+		}
+		const auto wrapper = std::find_if(g_modules.begin(), g_modules.end(),
+			[](const ModuleRecord& record) { return record.module == g_activeWrapper; });
+		return universal_wrapper_profile::SafeMaximumMultiplier(wrapper->compiledMaximum) - 1;
 	}
 }
