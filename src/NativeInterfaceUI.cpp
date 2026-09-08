@@ -10,6 +10,124 @@
 #include "ENBRenderDomain.h"
 #include "Util.h"
 #include "Upscaling.h"
+#include <d3d11_1.h>
+
+namespace WorldGuides
+{
+// Keep the raw world/first-person guides across Interface3D's offscreen
+	// model and screen-mesh passes. FG owns a separate, earlier snapshot.
+	class WorldGuideScope
+	{
+	public:
+		explicit WorldGuideScope(bool enabled);
+		~WorldGuideScope();
+		WorldGuideScope(const WorldGuideScope&) = delete;
+		WorldGuideScope& operator=(const WorldGuideScope&) = delete;
+
+	private:
+		bool captured = false;
+	};
+
+	void Release();
+
+namespace
+{
+	winrt::com_ptr<ID3D11Texture2D> motionBackup, depthBackup;
+	winrt::com_ptr<ID3D11Texture2D> motionSource, depthSource;
+	winrt::com_ptr<ID3D11DeviceContext1> context;
+	winrt::com_ptr<ID3DDeviceContextState> cleanState;
+	bool active = false;
+
+	struct ContextScope
+	{
+		winrt::com_ptr<ID3DDeviceContextState> previous;
+		ContextScope() { context->SwapDeviceContextState(cleanState.get(), previous.put()); }
+		~ContextScope() { context->SwapDeviceContextState(previous.get(), nullptr); }
+	};
+
+	void EnsureBackup(ID3D11Device* device, ID3D11Texture2D* source,
+		winrt::com_ptr<ID3D11Texture2D>& backup)
+	{
+		D3D11_TEXTURE2D_DESC desc{}, previous{};
+		source->GetDesc(&desc);
+		if (backup) { backup->GetDesc(&previous); }
+		if (backup && desc.Width == previous.Width && desc.Height == previous.Height &&
+			desc.Format == previous.Format && desc.MipLevels == previous.MipLevels &&
+			desc.ArraySize == previous.ArraySize && desc.SampleDesc.Count == previous.SampleDesc.Count &&
+			desc.SampleDesc.Quality == previous.SampleDesc.Quality) {
+			return;
+		}
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = 0;
+		desc.CPUAccessFlags = 0;
+		desc.MiscFlags = 0;
+		winrt::com_ptr<ID3D11Texture2D> next;
+		DX::ThrowIfFailed(device->CreateTexture2D(&desc, nullptr, next.put()));
+		backup = std::move(next);
+	}
+}
+
+WorldGuideScope::WorldGuideScope(bool enabled)
+{
+	// A nested RenderAll remains inside the outer snapshot. In particular,
+	// never replace the world backup with an intermediate model's guides.
+	if (!enabled || active) { return; }
+	try {
+		auto* data = RE::BSGraphics::GetRendererData();
+		auto* motion = reinterpret_cast<ID3D11Texture2D*>(data->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
+		auto* depth = reinterpret_cast<ID3D11Texture2D*>(data->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].texture);
+		if (!motion || !depth) { return; }
+		auto* device = reinterpret_cast<ID3D11Device*>(data->device);
+		if (!context) {
+			DX::ThrowIfFailed(reinterpret_cast<ID3D11DeviceContext*>(data->context)->QueryInterface(IID_PPV_ARGS(context.put())));
+		}
+		if (!cleanState) {
+			winrt::com_ptr<ID3D11Device1> device1;
+			DX::ThrowIfFailed(device->QueryInterface(IID_PPV_ARGS(device1.put())));
+			const auto level = device->GetFeatureLevel();
+			DX::ThrowIfFailed(device1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION,
+				__uuidof(ID3D11Device), nullptr, cleanState.put()));
+		}
+		EnsureBackup(device, motion, motionBackup);
+		EnsureBackup(device, depth, depthBackup);
+		motionSource.copy_from(motion);
+		depthSource.copy_from(depth);
+		ContextScope scope;
+		context->CopyResource(motionBackup.get(), motionSource.get());
+		context->CopyResource(depthBackup.get(), depthSource.get());
+		captured = active = true;
+	} catch (const std::exception& e) {
+		logger::error("[Interface3D motion] World guide preservation unavailable: {}", e.what());
+	}
+}
+
+WorldGuideScope::~WorldGuideScope()
+{
+	if (!captured) { return; }
+	{
+		ContextScope scope;
+		// Restore the exact resources captured before any native-depth slot
+		// borrowing. Do not resolve the temporarily redirected engine slots.
+		context->CopyResource(motionSource.get(), motionBackup.get());
+		context->CopyResource(depthSource.get(), depthBackup.get());
+	}
+	motionSource = nullptr;
+	depthSource = nullptr;
+	active = false;
+}
+
+void Release()
+{
+	motionBackup = nullptr;
+	depthBackup = nullptr;
+	motionSource = nullptr;
+	depthSource = nullptr;
+	context = nullptr;
+	cleanState = nullptr;
+	active = false;
+}
+
+}
 
 namespace
 {
@@ -331,6 +449,9 @@ namespace
 	{
 		static void thunk(uint32_t a_target, bool a_postAA)
 		{
+			// Capture before RenderScope can borrow the native depth slot; restore
+			// after all models and their screen meshes, including early returns.
+			WorldGuides::WorldGuideScope worldGuides(enabled && !a_postAA);
 			// Composition is common to both proxy paths; native depth/viewport
 			// routing remains ENB-only. Restore the pass flag across nested calls.
 			struct ScreenPassScope
@@ -386,6 +507,7 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 	static REL::Relocation<HasMenus> hasMenus{ REL::ID{ 1574554, 2284758 } };
 
 	RE::BSAutoReadLock listLock(*lock);
+	WorldGuides::WorldGuideScope worldGuides(true);
 	RenderScope scope;
 	struct ShaderScope
 	{
@@ -416,8 +538,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		// RT63 is shared with HUDGlass. Produce and consume this renderer's
 		// output consecutively, with the native-color depth hook active for
 		// every intermediate bind. Never cache an SRV for later composition.
-		ModelPrepasses::func(renderer);
-		ModelMain::func(renderer, a_target);
+		ModelPrepasses::thunk(renderer);
+		ModelMain::thunk(renderer, a_target);
 		renderedModels[renderedModelCount++] = renderer;
 		RE::BSAutoWriteLock quadsLock(renderer->cachedQuadsLock);
 		renderer->colorFXInfos.clear();
@@ -427,6 +549,7 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 
 void NativeInterfaceUI::ReleaseResources()
 {
+	WorldGuides::Release();
 	// Called by the interop resize transaction, after outstanding GPU work drains.
 	// Do not retain a former device's depth allocation across a resize/recreation.
 	nativeDepth.Restore();
