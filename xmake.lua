@@ -5,7 +5,7 @@ includes("lib/commonlibf4")
 
 -- set project constants
 set_project("Upscaling")
-set_version("1.5.3")
+set_version("1.6.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
@@ -20,6 +20,12 @@ add_defines("COMMONLIB_RUNTIMECOUNT=3")
 add_requires("directxtk", "directx-headers", "magic_enum", "simpleini")
 
 -- define targets
+option("nr_capture")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable NR diagnostic capture and its developer menu controls")
+option_end()
+
 target("Upscaling")
     set_kind("shared")
     set_filename("Upscaling.dll")
@@ -38,6 +44,11 @@ target("Upscaling")
 
     -- add src files
     add_files("src/**.cpp")
+    if has_config("nr_capture") then
+        add_defines("UPSCALING_NR_CAPTURE")
+    else
+        remove_files("src/NRDiagnosticCapture.cpp")
+    end
     add_headerfiles("src/**.h")
     add_headerfiles("include/**.h", "include/**.hpp")
     add_includedirs("src", "include")

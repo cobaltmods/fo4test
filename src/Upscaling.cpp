@@ -765,8 +765,9 @@ namespace
 
 		HANDLE sharedHandle = nullptr;
 		DX::ThrowIfFailed(dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle));
-		DX::ThrowIfFailed(DX12SwapChain::GetSingleton()->GetD3D12Device()->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(a_d3d12Resource.put())));
+		const auto openResult = DX12SwapChain::GetSingleton()->GetD3D12Device()->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(a_d3d12Resource.put()));
 		CloseHandle(sharedHandle);
+		DX::ThrowIfFailed(openResult);
 	}
 
 	void ClearDLSSGComputeBindings(ID3D11DeviceContext* a_context)
@@ -1484,8 +1485,7 @@ struct ForwardAlphaImpl_FinishAccumulating_Standard_PostResolveDepth
 		auto upscaling = Upscaling::GetSingleton();
 		auto fidelityFX = FidelityFX::GetSingleton();
 
-		if (upscaling->upscaleMethod == Upscaling::UpscaleMethod::kFSR ||
-			upscaling->upscaleMethod == Upscaling::UpscaleMethod::kDLSS)
+		if (upscaling->upscaleMethod == Upscaling::UpscaleMethod::kFSR)
 			fidelityFX->CopyOpaqueTexture();
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -1781,6 +1781,7 @@ void Upscaling::LoadSettings()
 	const auto previousDynamicMFGEnabled = settings.dynamicMFGEnabled;
 	const auto previousDLSSModelPreset = settings.dlssModelPreset;
 	const auto previousDLSSNREnabled = settings.dlssNREnabled;
+	const auto previousDLSSNRPassCount = settings.dlssNRPassCount;
 	const auto previousDLSSNRPerformanceMode = settings.dlssNRPerformanceMode;
 	const auto previousDLSSNRPreset = settings.dlssNRPreset;
 	const auto previousDLSSNRStyle = settings.dlssNRStyle;
@@ -1804,14 +1805,15 @@ void Upscaling::LoadSettings()
 	settings.reflexMode = static_cast<uint>(ini.GetLongValue("Settings", "iReflexMode", 1));
 	settings.dlssModelPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iDLSSModelPreset", 0), 0, 4));
 	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 1) == 1);
+	settings.dlssNRPassCount = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPassCount", 1), 1, 3));
 	settings.dlssNRPerformanceMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPerformanceMode", 0), 0, 5));
 	settings.dlssNRPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPreset", 0), 0, 3));
 	settings.dlssNRStyle = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iStyle", 0), 0, 2));
 	settings.dlssNRUseAutoMask = static_cast<uint>(ini.GetLongValue("DLSSNR", "bUseAutoMask", 0) == 1);
 	settings.dlssNRIntensity = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fIntensity", 1.0)), 0.0f, 1.0f);
-	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 1.0f);
-	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 1.0f);
-	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 1.0f);
+	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 2.0f);
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
@@ -1829,6 +1831,7 @@ void Upscaling::LoadSettings()
 		previousDynamicMFGEnabled != settings.dynamicMFGEnabled ||
 		previousDLSSModelPreset != settings.dlssModelPreset ||
 		previousDLSSNREnabled != settings.dlssNREnabled ||
+		previousDLSSNRPassCount != settings.dlssNRPassCount ||
 		previousDLSSNRPerformanceMode != settings.dlssNRPerformanceMode ||
 		previousDLSSNRPreset != settings.dlssNRPreset ||
 		previousDLSSNRStyle != settings.dlssNRStyle ||
@@ -1893,6 +1896,7 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.Delete("Settings", "bTaggedTextureDebug");
 
 	ini.SetLongValue("DLSSNR", "bEnabled", static_cast<long>(a_settings.dlssNREnabled));
+	ini.SetLongValue("DLSSNR", "iPassCount", static_cast<long>(std::clamp(a_settings.dlssNRPassCount, 1u, 3u)));
 	ini.SetLongValue("DLSSNR", "iPerformanceMode", static_cast<long>(a_settings.dlssNRPerformanceMode));
 	ini.SetLongValue("DLSSNR", "iPreset", static_cast<long>(a_settings.dlssNRPreset));
 	ini.SetLongValue("DLSSNR", "iStyle", static_cast<long>(a_settings.dlssNRStyle));
@@ -3648,16 +3652,14 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			return;
 		}
 
-		// CaptureDLSSGInputs receives the preserved/patched motion resource when
-		// it is current. FSR SR receives engine motion directly. Neither reads
-		// the dilation output in those cases; keep their existing inputs intact.
+		// Dilation is only an FG fallback. NR/SR captures engine guides directly.
 		const bool usePreservedMotionVectors =
 			frameGenerationBuffersReady &&
 			frameGenerationBuffersFrame == gameViewport->frameCount &&
 			frameGenerationMotionVectorTexture &&
 			frameGenerationMotionVectorTexture->resource;
 		const bool needsDilatedMotionVectors =
-			(d3d12DLSSActive || frameGenerationActive || fsrFrameGenerationActive) && !usePreservedMotionVectors;
+			(frameGenerationActive || fsrFrameGenerationActive) && !usePreservedMotionVectors;
 		if (needsDilatedMotionVectors) {
 			UpdateAndBindUpscalingCB(context, displaySize, renderSize);
 
@@ -4261,12 +4263,100 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	return fsrD3D12InputsReady[frameIndex];
 }
 
+bool Upscaling::CaptureNRMotion(UINT slot, UINT width, UINT height)
+{
+	auto* data = RE::BSGraphics::GetRendererData();
+	auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
+	winrt::com_ptr<ID3D11Device> device;
+	context->GetDevice(device.put());
+	if (!nrMotionCS) {
+		// Keep the tiny conversion embedded so a DLL-only update cannot leave
+		// an old packaged shader silently producing uncorrected guides.
+		constexpr char source[] = R"(
+Texture2D<float2> engineMV : register(t0);
+RWTexture2D<float2> nrMV : register(u0);
+cbuffer Parameters : register(b0) { float2 extent; float2 jitterDelta; };
+[numthreads(8,8,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= (uint2)extent)) return;
+    nrMV[id.xy] = engineMV.Load(int3(id.xy,0)) * extent + jitterDelta;
+}
+)";
+		winrt::com_ptr<ID3DBlob> code, errors;
+		if (FAILED(D3DCompile(source, sizeof(source) - 1, "NRMotion", nullptr, nullptr, "main", "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.put(), errors.put())) ||
+			FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, nrMotionCS.put()))) {
+			logger::warn("[NR motion] Could not create conversion shader; NR skipped");
+			return false;
+		}
+	}
+	if (!nrMotionConstants) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 16;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		if (FAILED(device->CreateBuffer(&desc, nullptr, nrMotionConstants.put()))) { return false; }
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	desc.Width = width;
+	desc.Height = height;
+	desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+	// RG32F with this shared-resource contract fails CreateTexture2D with
+	// E_INVALIDARG. Use the same shareable RG16F format as the existing MV path.
+	desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	EnsureSharedD3D12Texture(this, desc, nrMotionSharedTextures[slot], nrMotionD3D12[slot], true);
+	// The shared helper creates the resource/UAV, not an SRV. Raw SR guides
+	// previously only needed CopySubresourceRegion and therefore had no SRV.
+	if (!dlssMotionVectorSharedTextures[slot]->srv) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = dlssMotionVectorSharedTextures[slot]->desc.Format;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		dlssMotionVectorSharedTextures[slot]->CreateSRV(srvDesc);
+	}
+
+	const auto frame = Util::State_GetSingleton()->frameCount;
+	const float2 size(static_cast<float>(width), static_cast<float>(height));
+	const bool sameSize = nrMotionPreviousSize.x == size.x && nrMotionPreviousSize.y == size.y;
+	if (!nrMotionHistoryValid || !sameSize || (frame != nrMotionPreviousFrame && frame != nrMotionPreviousFrame + 1u)) {
+		nrMotionCurrentDelta = {};
+		Streamline::GetSingleton()->RequestTemporalReset();
+	} else if (frame != nrMotionPreviousFrame) {
+		// Published SL jitter is -engine jitter. Previous minus current SL
+		// jitter is therefore current minus previous engine jitter (pixels).
+		nrMotionCurrentDelta = jitter - nrMotionPreviousJitter;
+	}
+	nrMotionPreviousFrame = frame;
+	nrMotionPreviousSize = size;
+	nrMotionPreviousJitter = jitter;
+	nrMotionHistoryValid = true;
+	nrMotionJitterDeltas[slot] = nrMotionCurrentDelta;
+	const float constants[]{ size.x, size.y, nrMotionCurrentDelta.x, nrMotionCurrentDelta.y };
+	context->UpdateSubresource(nrMotionConstants.get(), 0, nullptr, constants, 0, 0);
+	winrt::com_ptr<ID3D11Buffer> previousCB;
+	context->CSGetConstantBuffers(0, 1, previousCB.put());
+	ID3D11Buffer* cb = nrMotionConstants.get();
+	context->CSSetConstantBuffers(0, 1, &cb);
+	ID3D11ShaderResourceView* srv = dlssMotionVectorSharedTextures[slot]->srv.get();
+	ID3D11UnorderedAccessView* uav = nrMotionSharedTextures[slot]->uav.get();
+	context->CSSetShaderResources(0, 1, &srv);
+	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	context->CSSetShader(nrMotionCS.get(), nullptr, 0);
+	context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+	ClearDLSSGComputeBindings(context);
+	cb = previousCB.get();
+	context->CSSetConstantBuffers(0, 1, &cb);
+	return true;
+}
+
 void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_motionVectorTexture, float2 a_renderSize, float2 a_displaySize)
 {
 	// Invalidate this slot before any early return (including a guide mismatch).
 	// A resource remaining alive does not mean it contains this frame's inputs.
 	const auto captureIndex = DX12SwapChain::GetSingleton()->GetFrameIndex();
 	if (captureIndex < dlssD3D12InputsReady.size()) {
+		nrMotionReady[captureIndex] = false;
 		dlssDepthCaptureFrames[captureIndex] = 0;
 		dlssD3D12InputsReady[captureIndex] = false;
 		dlssgInputsReady[captureIndex] = false;
@@ -4345,6 +4435,16 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 	}
 
+	if (useD3D12DLSS && (motionVectorDesc.Width < static_cast<UINT>(a_renderSize.x) ||
+		motionVectorDesc.Height < static_cast<UINT>(a_renderSize.y) ||
+		depthDesc.Width < static_cast<UINT>(a_renderSize.x) || depthDesc.Height < static_cast<UINT>(a_renderSize.y))) {
+		// Cropping color to a smaller guide changes the effective SR scale and
+		// invalidates MV/jitter normalization. Reject instead of silently cropping.
+		logger::warn("[Upscaling] DLSS guides do not cover the current render extent");
+		streamline->RequestTemporalReset();
+		return;
+	}
+
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	if (DX12SwapChain::GetSingleton()->IsReady()) {
@@ -4411,46 +4511,11 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				EnsureSharedD3D12Texture(this, sharpenedDesc, dlssSharpenedSharedTextures[frameIndex], dlssSharpenedD3D12[frameIndex], true);
 			}
 
+			// The opaque snapshot is pre-imagespace HDR; this input is post-
+			// imagespace LDR (and may include ENB grading). Their difference is
+			// not a transparency mask. Leave optional hints absent rather than
+			// treating tonemapping/exposure changes as transparent geometry.
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
-			auto* opaqueOnly = FidelityFX::GetSingleton()->colorOpaqueOnlyTexture.get();
-			if (opaqueOnly && opaqueOnly->srv && upscalingTexture->srv) {
-				D3D11_TEXTURE2D_DESC maskDesc{};
-				maskDesc.Width = static_cast<UINT>(a_renderSize.x);
-				maskDesc.Height = static_cast<UINT>(a_renderSize.y);
-				maskDesc.MipLevels = 1;
-				maskDesc.ArraySize = 1;
-				maskDesc.Format = DXGI_FORMAT_R32_FLOAT;
-				maskDesc.SampleDesc.Count = 1;
-				maskDesc.Usage = D3D11_USAGE_DEFAULT;
-				maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-				// WaitForFrameSlot above protects this slot from its previous D3D12
-				// reader. Generate directly into the shared input; the input-ready
-				// signal below orders these UAV writes before DLSS reads them.
-				EnsureSharedD3D12Texture(this, maskDesc, dlssTransparencyMaskSharedTextures[frameIndex], dlssTransparencyMaskD3D12[frameIndex], true);
-				auto* mask = dlssTransparencyMaskSharedTextures[frameIndex].get();
-
-				auto shader = GetGenerateDLSSTransparencyMaskCS();
-				if (shader && mask && mask->uav) {
-					ID3D11ShaderResourceView* views[] = {
-						opaqueOnly->srv.get(),
-						ENBRenderDomain::Get().Active() ? frameBufferSRV : upscalingTexture->srv.get()
-					};
-					context->CSSetShaderResources(0, ARRAYSIZE(views), views);
-
-					ID3D11UnorderedAccessView* uavs[] = {
-						mask->uav.get()
-					};
-					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-					context->CSSetShader(shader, nullptr, 0);
-
-					context->Dispatch((maskDesc.Width + 7) / 8, (maskDesc.Height + 7) / 8, 1);
-					ID3D11ShaderResourceView* nullViews[2] = {};
-					context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
-					ClearDLSSGComputeBindings(context);
-
-					dlssD3D12TransparencyMaskReady[frameIndex] = true;
-				}
-			}
 		} else {
 			dlssD3D12InputsReady[frameIndex] = false;
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
@@ -4567,6 +4632,60 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			}
 		}
 
+		if (useD3D12DLSS && dlssDepthCaptureFrames[frameIndex] != static_cast<uint64_t>(gameViewport->frameCount) + 1) {
+			logger::warn("[Upscaling] DLSS rejected stale/incomplete depth capture");
+			streamline->RequestTemporalReset();
+			return;
+		}
+
+		if (useD3D12DLSS) {
+			// Never feed FG's alpha repair or dilated fallback into temporal NR/SR.
+			// These writes use the same frame-slot wait and submission as color/FG.
+			auto* engineMotion = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
+			auto* engineDepth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+			auto* copyDepth = GetCopyDepthToFrameGenerationCS();
+			D3D11_TEXTURE2D_DESC engineMotionDesc{};
+			if (engineMotion) {
+				engineMotion->GetDesc(&engineMotionDesc);
+			}
+			if (!engineMotion || !engineDepth || !copyDepth ||
+				engineMotionDesc.Width < sharedDepthDesc.Width || engineMotionDesc.Height < sharedDepthDesc.Height ||
+				engineMotionDesc.SampleDesc.Count != 1 || engineMotionDesc.ArraySize != 1) {
+				streamline->RequestTemporalReset();
+				return;
+			}
+			auto rawMotionDesc = engineMotionDesc;
+			rawMotionDesc.Width = sharedDepthDesc.Width;
+			rawMotionDesc.Height = sharedDepthDesc.Height;
+			rawMotionDesc.MipLevels = 1;
+			rawMotionDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			rawMotionDesc.MiscFlags = 0;
+			EnsureSharedD3D12Texture(this, rawMotionDesc, dlssMotionVectorSharedTextures[frameIndex], dlssMotionVectorD3D12[frameIndex], false);
+			EnsureSharedD3D12Texture(this, sharedDepthDesc, dlssDepthSharedTextures[frameIndex], dlssDepthD3D12[frameIndex], true);
+			const D3D11_BOX sourceBox{ 0, 0, 0, rawMotionDesc.Width, rawMotionDesc.Height, 1 };
+			context->CopySubresourceRegion(dlssMotionVectorSharedTextures[frameIndex]->resource.get(), 0, 0, 0, 0, engineMotion, 0, &sourceBox);
+			ID3D11ShaderResourceView* views[] = { engineDepth };
+			ID3D11UnorderedAccessView* uavs[] = { dlssDepthSharedTextures[frameIndex]->uav.get() };
+			context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+			context->CSSetShader(copyDepth, nullptr, 0);
+			context->Dispatch((rawMotionDesc.Width + 7) / 8, (rawMotionDesc.Height + 7) / 8, 1);
+			ClearDLSSGComputeBindings(context);
+			dlssD3D12MotionVectorFormats[frameIndex] = rawMotionDesc.Format;
+			dlssD3D12DepthFormats[frameIndex] = sharedDepthDesc.Format;
+			if (settings.dlssNREnabled) {
+				try {
+					nrMotionReady[frameIndex] = CaptureNRMotion(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height);
+				} catch (const std::exception& e) {
+					// A failed optional NR conversion must not discard valid SR inputs.
+					nrMotionHistoryValid = false;
+					logger::warn("[NR motion] Conversion unavailable; SR retains raw guides: {}", e.what());
+				}
+			} else {
+				nrMotionHistoryValid = false;
+			}
+		}
+
 		bool useDLSSGThisFrame = useFrameGeneration;
 		if (useDLSSGThisFrame) {
 			streamline->UpdateReflex(settings.reflexMode, true);
@@ -4596,7 +4715,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 
 		static uint64_t fsrFrameGenerationFrameID = 0;
-		dlssgInputRenderSizes[frameIndex] = dlssgInputSize;
+		dlssgInputRenderSizes[frameIndex] = useD3D12DLSS ? a_renderSize : dlssgInputSize;
 		dlssgInputDisplaySizes[frameIndex] = a_displaySize;
 		dlssgInputFrameTokenIndices[frameIndex] = streamline->GetCurrentFrameTokenIndex();
 		dlssgInputsReady[frameIndex] = useDLSSGThisFrame;
@@ -4605,8 +4724,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		fsrFrameGenerationFrameIDs[frameIndex] = fsrFrameGenerationFrameID++;
 		dlssD3D12InputsReady[frameIndex] = useD3D12DLSS;
 		dlssD3D12ColorFormats[frameIndex] = frameBufferDesc.Format;
-		dlssD3D12MotionVectorFormats[frameIndex] = sharedMotionVectorDesc.Format;
-		dlssD3D12DepthFormats[frameIndex] = sharedDepthDesc.Format;
 
 		return;
 	}
@@ -4646,8 +4763,8 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 	auto* dlssInput = dlssInputD3D12[a_frameIndex].get();
 	auto* dlssOutput = dlssgHUDLessD3D12[a_frameIndex].get();
 	auto* dlssSharpenedOutput = dlssSharpenedD3D12[a_frameIndex].get();
-	auto* motionVectors = dlssgMotionVectorD3D12[a_frameIndex].get();
-	auto* depth = dlssgDepthD3D12[a_frameIndex].get();
+	auto* motionVectors = dlssMotionVectorD3D12[a_frameIndex].get();
+	auto* depth = dlssDepthD3D12[a_frameIndex].get();
 	auto* transparencyMask = dlssD3D12TransparencyMaskReady[a_frameIndex] ? dlssTransparencyMaskD3D12[a_frameIndex].get() : nullptr;
 	if (!dlssInput || !dlssOutput || !motionVectors || !depth || !a_commandList) {
 		logger::warn(
@@ -4721,6 +4838,9 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 		GetEffectiveQualityMode(UpscaleMethod::kDLSS, settings.qualityMode),
 		settings.sharpness,
 		settings.dlssModelPreset,
+		settings.dlssNRPassCount,
+		nrMotionReady[a_frameIndex] ? nrMotionD3D12[a_frameIndex].get() : nullptr,
+		nrMotionJitterDeltas[a_frameIndex],
 		dlssNROptions,
 		&dlssD3D12Sharpened[a_frameIndex]);
 	if (succeeded && useSharpenedOutput && !dlssD3D12Sharpened[a_frameIndex]) {
@@ -4958,6 +5078,8 @@ void Upscaling::CreateUpscalingResources()
 void Upscaling::DestroyUpscalingResources()
 {
 	dlssDepthCaptureFrames.fill(0);
+	nrMotionReady.fill(false);
+	nrMotionHistoryValid = false;
 	fsrDepthCaptureFrames.fill(0);
 	reshadeDepthCaptureFrames.fill(0);
 	reshadeSceneDepthFrame = 0;
@@ -4981,6 +5103,9 @@ void Upscaling::DestroyUpscalingResources()
 		RetireSharedD3D12Texture(dlssgHUDLessSharedTextures[i], dlssgHUDLessD3D12[i]);
 		RetireSharedD3D12Texture(dlssgMotionVectorSharedTextures[i], dlssgMotionVectorD3D12[i]);
 		RetireSharedD3D12Texture(dlssgDepthSharedTextures[i], dlssgDepthD3D12[i]);
+		RetireSharedD3D12Texture(dlssMotionVectorSharedTextures[i], dlssMotionVectorD3D12[i]);
+		RetireSharedD3D12Texture(nrMotionSharedTextures[i], nrMotionD3D12[i]);
+		RetireSharedD3D12Texture(dlssDepthSharedTextures[i], dlssDepthD3D12[i]);
 		RetireSharedD3D12Texture(dlssTransparencyMaskSharedTextures[i], dlssTransparencyMaskD3D12[i]);
 		RetireSharedD3D12Texture(enbFallbackSharedTextures[i], enbFallbackD3D12[i]);
 		RetireSharedD3D12Texture(fsrInputSharedTextures[i], fsrInputD3D12[i]);

@@ -1,4 +1,7 @@
 #include "UpscalingMenu.h"
+#ifdef UPSCALING_NR_CAPTURE
+#include "NRDiagnosticCapture.h"
+#endif
 
 #include "F4SEMenuFramework.h"
 #include <atomic>
@@ -282,6 +285,9 @@ namespace
 	void __stdcall OnMenuEvent(F4SEMenuFramework::Events::Type a_type)
 	{
 		if (a_type == F4SEMenuFramework::Events::kOpenMenu) {
+#ifdef UPSCALING_NR_CAPTURE
+			NRDiagnosticCapture::MenuChanged(true);
+#endif
 			g_frameworkMenuOpen.store(true, std::memory_order_relaxed);
 			InitializeEditState();
 			return;
@@ -291,6 +297,9 @@ namespace
 			return;
 		}
 		g_frameworkMenuOpen.store(false, std::memory_order_relaxed);
+#ifdef UPSCALING_NR_CAPTURE
+		NRDiagnosticCapture::MenuChanged(false);
+#endif
 		g_dlssNRHotkeyCapturing = false;
 
 		std::optional<Settings> settingsToSave;
@@ -419,8 +428,15 @@ namespace
 		changed |= CheckboxSetting(
 			"DLSS Neural Rendering",
 			settings.dlssNREnabled,
-			"Runs the experimental DLSS-NR pass after DLSS SR. If NR fails, the prepared SR result is retained.");
+			"Runs experimental DLSS-NR before DLSS SR. If NR fails, SR uses the original color input.");
 		ImGuiMCP::BeginDisabled(settings.dlssNREnabled == 0);
+		changed |= SliderIntSetting(
+			"NR Passes",
+			settings.dlssNRPassCount,
+			1,
+			3,
+			"%d",
+			"Runs up to three independent direct-NGX NR histories. Streamline-native NR remains single-pass.");
 		static constexpr std::array nrStyles{ "Default", "Natural", "Cinematic" };
 		changed |= ComboSetting(
 			"NR Style",
@@ -428,8 +444,8 @@ namespace
 			nrStyles,
 			"Selects the Neural Rendering appearance style.");
 		changed |= SliderFloatSetting("NR Intensity", settings.dlssNRIntensity, 0.0f, 1.0f, "%.2f", "Controls overall Neural Rendering strength.");
-		changed |= SliderFloatSetting("Local Tone Strength", settings.dlssNRLocalToneStrength, 0.0f, 1.0f, "%.2f", "Controls local tone enhancement.");
-		changed |= SliderFloatSetting("Local Structure Strength", settings.dlssNRLocalStructureStrength, 0.0f, 1.0f, "%.2f", "Controls local structure enhancement.");
+		changed |= SliderFloatSetting("Local Tone Strength", settings.dlssNRLocalToneStrength, 0.0f, 2.0f, "%.2f", "Controls local tone enhancement. Values above 1 are experimental.");
+		changed |= SliderFloatSetting("Local Structure Strength", settings.dlssNRLocalStructureStrength, 0.0f, 2.0f, "%.2f", "Controls local structure enhancement. Values above 1 are experimental.");
 		changed |= CheckboxSetting(
 			"Automatic Mask",
 			settings.dlssNRUseAutoMask,
@@ -439,12 +455,21 @@ namespace
 			"Skin Structure Strength",
 			settings.dlssNRSkinStructureStrength,
 			-1.0f,
-			1.0f,
+			2.0f,
 			"%.2f",
-			"Controls structure enhancement in inferred skin regions. -1 inherits Local Structure Strength.");
+			"Controls structure enhancement in inferred skin regions. -1 inherits Local Structure Strength. Values above 1 are experimental.");
 		ImGuiMCP::EndDisabled();
 		ImGuiMCP::EndDisabled();
 		ImGuiMCP::EndDisabled();
+
+#ifdef UPSCALING_NR_CAPTURE
+		ImGuiMCP::SeparatorText("NR Diagnostic Capture");
+		if (ImGuiMCP::Button("Arm 32-frame NR capture")) {
+			NRDiagnosticCapture::Arm();
+		}
+		ShowHelp("Close this menu to start a 2-second countdown. Requires active DLSS NR. Saves raw input, motion, depth, NR and SR output plus JSON metadata. GPU copies can affect performance during capture.");
+		ImGuiMCP::Text("%s", NRDiagnosticCapture::Status().c_str());
+#endif
 
 		ImGuiMCP::SeparatorText("Hotkeys");
 		ImGuiMCP::BeginDisabled(g_dlssNRHotkeyHandle < 0);

@@ -1,4 +1,7 @@
 #include "nvngx_dlss_nr_private.h"
+#ifdef UPSCALING_NR_CAPTURE
+#include "NRDiagnosticCapture.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -402,89 +405,97 @@ namespace nvngx::dlss_nr
 		return true;
 	}
 
-	void D3D12Backend::SetCreationParameters(const D3D12EvaluationParameters& a_parameters)
+	void D3D12Backend::SetCreationParameters(
+		NVSDK_NGX_Parameter* a_parameters,
+		const D3D12EvaluationParameters& a_evaluationParameters)
 	{
 		const auto upscaling =
-			a_parameters.inputWidth != a_parameters.outputWidth ||
-			a_parameters.inputHeight != a_parameters.outputHeight;
+			a_evaluationParameters.inputWidth != a_evaluationParameters.outputWidth ||
+			a_evaluationParameters.inputHeight != a_evaluationParameters.outputHeight;
 		const auto ratio = ScalingRatio(upscaling);
 		constexpr auto createFlags = static_cast<int>(
 			NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
 			NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
 
-		parameters_->Set(NVSDK_NGX_Parameter_Width, a_parameters.inputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_Height, a_parameters.inputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_OutWidth, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_OutHeight, a_parameters.outputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Width, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Height, a_parameters.outputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_InputWidth, a_parameters.inputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_InputHeight, a_parameters.inputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputWidth, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputHeight, a_parameters.outputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Output_Width, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Output_Height, a_parameters.outputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ScalingRatio, ratio);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Scale, ratio);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Upscaling, static_cast<int>(upscaling));
-		parameters_->Set(
+		a_parameters->Set(NVSDK_NGX_Parameter_Width, a_evaluationParameters.inputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_Height, a_evaluationParameters.inputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_OutWidth, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_OutHeight, a_evaluationParameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Width, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Height, a_evaluationParameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_InputWidth, a_evaluationParameters.inputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_InputHeight, a_evaluationParameters.inputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputWidth, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputHeight, a_evaluationParameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Output_Width, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Output_Height, a_evaluationParameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ScalingRatio, ratio);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Scale, ratio);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Upscaling, static_cast<int>(upscaling));
+		a_parameters->Set(
 			NVSDK_NGX_Parameter_DLSSNR_ComputeScalingRatioCallback,
 			reinterpret_cast<void*>(&NVSDK_NGX_DLSSNR_ComputeScalingRatio));
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Hint_Render_Preset, a_parameters.options.preset);
-		parameters_->Set(NVSDK_NGX_Parameter_PerfQualityValue, a_parameters.options.performanceMode - 1);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, createFlags);
-		parameters_->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-		parameters_->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Hint_Render_Preset, a_evaluationParameters.options.preset);
+		a_parameters->Set(NVSDK_NGX_Parameter_PerfQualityValue, a_evaluationParameters.options.performanceMode - 1);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, createFlags);
+		a_parameters->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
+		a_parameters->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
 	}
 
-	bool D3D12Backend::EnsureFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
+	bool D3D12Backend::EnsureFeature(
+		FeatureState& a_state,
+		ID3D12GraphicsCommandList* a_commandList,
+		const D3D12EvaluationParameters& a_parameters,
+		std::uint32_t a_passIndex)
 	{
 		if (!IsSupportedPerformanceMode(a_parameters.options.performanceMode)) {
 			logger::warn("[DLSS-NR Direct] Performance mode {} is unsupported", a_parameters.options.performanceMode);
 			return false;
 		}
 
-		if ((NeedsFeatureRecreation(a_parameters) || (!feature_ && parameters_)) && !ReleaseFeature()) {
+		if ((a_state.failureLatched || NeedsFeatureRecreation(a_state, a_parameters) ||
+			(!a_state.feature && a_state.parameters)) && !ReleaseFeature(a_state)) {
 			return false;
 		}
-		if (feature_) {
+		if (a_state.feature) {
 			return true;
 		}
 
-		const auto allocateResult = allocateParameters_(&parameters_);
-		if (!IsNGXSuccess(allocateResult) || !parameters_) {
+		const auto allocateResult = allocateParameters_(&a_state.parameters);
+		if (!IsNGXSuccess(allocateResult) || !a_state.parameters) {
 			logger::warn("[DLSS-NR Direct] AllocateParameters failed result=0x{:08X}", static_cast<std::uint32_t>(allocateResult));
 			// Retain any returned allocation for its matching DestroyParameters.
 			return false;
 		}
 
-		SetCreationParameters(a_parameters);
-		auto createResult = createFeature_(a_commandList, NVSDK_NGX_Feature_DLSSNR, parameters_, &feature_);
+		SetCreationParameters(a_state.parameters, a_parameters);
+		auto createResult = createFeature_(a_commandList, NVSDK_NGX_Feature_DLSSNR, a_state.parameters, &a_state.feature);
 		auto snippetCreateResult = createFeature_ == snippetCreateFeature_ ? createResult : NVSDK_NGX_Result_Success;
-		activeEvaluateFeature_ = evaluateFeature_;
-		activeReleaseFeature_ = releaseFeature_;
-		if (!feature_ && createFeature_ != snippetCreateFeature_) {
+		a_state.activeEvaluateFeature = evaluateFeature_;
+		a_state.activeReleaseFeature = releaseFeature_;
+		if (!a_state.feature && createFeature_ != snippetCreateFeature_) {
 			// Match RenoDX's creation sequence: the shared NGX core gets the first
 			// chance, then feature 18 is created through the signed snippet when the
 			// core reports UnableToInitializeFeature. Evaluation never retries across
 			// backends; it is bound to the creator selected here.
-			activeEvaluateFeature_ = snippetEvaluateFeature_;
-			activeReleaseFeature_ = snippetReleaseFeature_;
+			a_state.activeEvaluateFeature = snippetEvaluateFeature_;
+			a_state.activeReleaseFeature = snippetReleaseFeature_;
 			snippetCreateResult = snippetCreateFeature_(
 				a_commandList,
 				NVSDK_NGX_Feature_DLSSNR,
-				parameters_,
-				&feature_);
-			if (IsNGXSuccess(snippetCreateResult) && feature_) {
+				a_state.parameters,
+				&a_state.feature);
+			if (IsNGXSuccess(snippetCreateResult) && a_state.feature) {
 				logger::info(
 					"[DLSS-NR Direct] Shared NGX CreateFeature returned 0x{:08X}; feature 18 was created by nvngx_dlssnr.dll",
 					static_cast<std::uint32_t>(createResult));
 				createResult = snippetCreateResult;
 			}
 		}
-		if (!IsNGXSuccess(createResult) || !feature_) {
+		if (!IsNGXSuccess(createResult) || !a_state.feature) {
 			logger::warn(
-				"[DLSS-NR Direct] CreateFeature failed primaryResult=0x{:08X} snippetResult=0x{:08X} input={}x{} output={}x{} performanceMode={} preset={}",
+				"[DLSS-NR Direct] CreateFeature failed pass={} primaryResult=0x{:08X} snippetResult=0x{:08X} input={}x{} output={}x{} performanceMode={} preset={}",
+				a_passIndex + 1,
 				static_cast<std::uint32_t>(createResult),
 				static_cast<std::uint32_t>(snippetCreateResult),
 				a_parameters.inputWidth,
@@ -500,109 +511,239 @@ namespace nvngx::dlss_nr
 			return false;
 		}
 
-		featureInputWidth_ = a_parameters.inputWidth;
-		featureInputHeight_ = a_parameters.inputHeight;
-		featureOutputWidth_ = a_parameters.outputWidth;
-		featureOutputHeight_ = a_parameters.outputHeight;
-		featurePerformanceMode_ = a_parameters.options.performanceMode;
-		featurePreset_ = a_parameters.options.preset;
-		forceReset_ = true;
+		a_state.inputWidth = a_parameters.inputWidth;
+		a_state.inputHeight = a_parameters.inputHeight;
+		a_state.outputWidth = a_parameters.outputWidth;
+		a_state.outputHeight = a_parameters.outputHeight;
+		a_state.performanceMode = a_parameters.options.performanceMode;
+		a_state.preset = a_parameters.options.preset;
+		a_state.forceReset = true;
 		logger::info(
-			"[DLSS-NR Direct] Created NGX feature 18 input={}x{} output={}x{} performanceMode={} preset={}",
-			featureInputWidth_,
-			featureInputHeight_,
-			featureOutputWidth_,
-			featureOutputHeight_,
-			featurePerformanceMode_,
-			featurePreset_);
+			"[DLSS-NR Direct] Created NGX feature 18 pass={} input={}x{} output={}x{} performanceMode={} preset={}",
+			a_passIndex + 1,
+			a_state.inputWidth,
+			a_state.inputHeight,
+			a_state.outputWidth,
+			a_state.outputHeight,
+			a_state.performanceMode,
+			a_state.preset);
 		return true;
 	}
 
-	void D3D12Backend::SetEvaluationParameters(const D3D12EvaluationParameters& a_parameters, bool a_reset)
+	void D3D12Backend::SetEvaluationParameters(
+		NVSDK_NGX_Parameter* a_parameters,
+		const D3D12EvaluationParameters& a_evaluationParameters,
+		bool a_reset)
 	{
 		const auto upscaling =
-			a_parameters.inputWidth != a_parameters.outputWidth ||
-			a_parameters.inputHeight != a_parameters.outputHeight;
+			a_evaluationParameters.inputWidth != a_evaluationParameters.outputWidth ||
+			a_evaluationParameters.inputHeight != a_evaluationParameters.outputHeight;
 		const auto ratio = ScalingRatio(upscaling);
 
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Color, a_parameters.color);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Output, a_parameters.output);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVec, a_parameters.motionVectors);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Depth, a_parameters.depth);
-		parameters_->Set(NVSDK_NGX_Parameter_Width, a_parameters.inputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_Height, a_parameters.inputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_OutWidth, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_OutHeight, a_parameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Color, a_evaluationParameters.color);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Output, a_evaluationParameters.output);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVec, a_evaluationParameters.motionVectors);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Depth, a_evaluationParameters.depth);
+		a_parameters->Set(NVSDK_NGX_Parameter_Width, a_evaluationParameters.inputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_Height, a_evaluationParameters.inputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_OutWidth, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_OutHeight, a_evaluationParameters.outputHeight);
 
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseX, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseY, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectWidth, a_parameters.inputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectHeight, a_parameters.inputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseX, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseY, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectWidth, a_parameters.guideWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectHeight, a_parameters.guideHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecScaleX, a_parameters.motionVectorScaleX);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_MVecScaleY, a_parameters.motionVectorScaleY);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseX, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseY, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectWidth, a_parameters.guideWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectHeight, a_parameters.guideHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_DepthInverted, static_cast<int>(a_parameters.depthInverted));
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseX, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseY, 0u);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectWidth, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectHeight, a_parameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseX, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseY, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectWidth, a_evaluationParameters.inputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ColorSubrectHeight, a_evaluationParameters.inputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseX, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseY, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectWidth, a_evaluationParameters.guideWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecSubrectHeight, a_evaluationParameters.guideHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecScaleX, a_evaluationParameters.motionVectorScaleX);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_MVecScaleY, a_evaluationParameters.motionVectorScaleY);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseX, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseY, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectWidth, a_evaluationParameters.guideWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_DepthSubrectHeight, a_evaluationParameters.guideHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_DepthInverted, static_cast<int>(a_evaluationParameters.depthInverted));
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseX, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseY, 0u);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectWidth, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputSubrectHeight, a_evaluationParameters.outputHeight);
 
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_InputWidth, a_parameters.inputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_InputHeight, a_parameters.inputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputWidth, a_parameters.outputWidth);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_OutputHeight, a_parameters.outputHeight);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_ScalingRatio, ratio);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Scale, ratio);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Upscaling, static_cast<int>(upscaling));
-		parameters_->Set(
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_InputWidth, a_evaluationParameters.inputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_InputHeight, a_evaluationParameters.inputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputWidth, a_evaluationParameters.outputWidth);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_OutputHeight, a_evaluationParameters.outputHeight);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_ScalingRatio, ratio);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Scale, ratio);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Upscaling, static_cast<int>(upscaling));
+		a_parameters->Set(
 			NVSDK_NGX_Parameter_DLSSNR_ComputeScalingRatioCallback,
 			reinterpret_cast<void*>(&NVSDK_NGX_DLSSNR_ComputeScalingRatio));
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Enabled, 1);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Reset, static_cast<int>(a_reset));
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Intensity, a_parameters.options.intensity);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_LocalToneStrength, a_parameters.options.localToneStrength);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_LocalStructureStrength, a_parameters.options.localStructureStrength);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_SkinStructureStrength, a_parameters.options.skinStructureStrength);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_UseAutoMask, static_cast<int>(a_parameters.options.useAutoMask));
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_Style, a_parameters.options.style);
-		parameters_->Set(NVSDK_NGX_Parameter_DLSSNR_UICorrection, 0);
-		parameters_->Set("DLSS.Indicator.Invert.X.Axis", 0);
-		parameters_->Set("DLSS.Indicator.Invert.Y.Axis", 0);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Enabled, 1);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Reset, static_cast<int>(a_reset));
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Intensity, a_evaluationParameters.options.intensity);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_LocalToneStrength, a_evaluationParameters.options.localToneStrength);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_LocalStructureStrength, a_evaluationParameters.options.localStructureStrength);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_SkinStructureStrength, a_evaluationParameters.options.skinStructureStrength);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_UseAutoMask, static_cast<int>(a_evaluationParameters.options.useAutoMask));
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_Style, a_evaluationParameters.options.style);
+		a_parameters->Set(NVSDK_NGX_Parameter_DLSSNR_UICorrection, 0);
+		a_parameters->Set("DLSS.Indicator.Invert.X.Axis", 0);
+		a_parameters->Set("DLSS.Indicator.Invert.Y.Axis", 0);
 	}
 
-	bool D3D12Backend::NeedsFeatureRecreation(const D3D12EvaluationParameters& a_parameters) const
+	bool D3D12Backend::NeedsFeatureRecreation(
+		const FeatureState& a_state,
+		const D3D12EvaluationParameters& a_parameters) const
 	{
-		return feature_ &&
-			(featureInputWidth_ != a_parameters.inputWidth ||
-				featureInputHeight_ != a_parameters.inputHeight ||
-				featureOutputWidth_ != a_parameters.outputWidth ||
-				featureOutputHeight_ != a_parameters.outputHeight ||
-				featurePerformanceMode_ != a_parameters.options.performanceMode ||
-				featurePreset_ != a_parameters.options.preset);
+		return a_state.feature &&
+			(a_state.inputWidth != a_parameters.inputWidth ||
+				a_state.inputHeight != a_parameters.inputHeight ||
+				a_state.outputWidth != a_parameters.outputWidth ||
+				a_state.outputHeight != a_parameters.outputHeight ||
+				a_state.performanceMode != a_parameters.options.performanceMode ||
+				a_state.preset != a_parameters.options.preset);
+	}
+
+	bool D3D12Backend::NeedsFeaturePreparation(
+		const FeatureState& a_state,
+		const D3D12EvaluationParameters& a_parameters) const
+	{
+		const auto sameFailedConfiguration =
+			a_state.failedInputWidth == a_parameters.inputWidth &&
+			a_state.failedInputHeight == a_parameters.inputHeight &&
+			a_state.failedOutputWidth == a_parameters.outputWidth &&
+			a_state.failedOutputHeight == a_parameters.outputHeight &&
+			a_state.failedGuideWidth == a_parameters.guideWidth &&
+			a_state.failedGuideHeight == a_parameters.guideHeight &&
+			a_state.failedPerformanceMode == a_parameters.options.performanceMode &&
+			a_state.failedPreset == a_parameters.options.preset;
+		if (a_state.failureLatched && sameFailedConfiguration) {
+			return false;
+		}
+		return !a_state.feature || NeedsFeatureRecreation(a_state, a_parameters) || a_state.failureLatched;
+	}
+
+	bool D3D12Backend::EnsureIntermediateResources(const D3D12EvaluationParameters& a_parameters)
+	{
+		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
+		if (passCount == 1) {
+			return true;
+		}
+		if (!device_ || a_parameters.outputFormat == DXGI_FORMAT_UNKNOWN) {
+			return false;
+		}
+
+		const auto requiredCount = passCount - 1;
+		const auto configurationMatches =
+			intermediateWidth_ == a_parameters.outputWidth &&
+			intermediateHeight_ == a_parameters.outputHeight &&
+			intermediateFormat_ == a_parameters.outputFormat;
+		bool resourcesReady = configurationMatches;
+		for (std::uint32_t i = 0; resourcesReady && i < requiredCount; ++i) {
+			resourcesReady = intermediateResources_[i] != nullptr;
+		}
+		if (resourcesReady) {
+			intermediateFailureLatched_ = false;
+			return true;
+		}
+
+		for (auto& resource : intermediateResources_) {
+			resource.Reset();
+		}
+		intermediateWidth_ = 0;
+		intermediateHeight_ = 0;
+		intermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+
+		const auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+		const auto resourceDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+			a_parameters.outputFormat,
+			a_parameters.outputWidth,
+			a_parameters.outputHeight,
+			1,
+			1,
+			1,
+			0,
+			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+		for (std::uint32_t i = 0; i < requiredCount; ++i) {
+			const auto result = device_->CreateCommittedResource(
+				&heapProperties,
+				D3D12_HEAP_FLAG_NONE,
+				&resourceDesc,
+				D3D12_RESOURCE_STATE_COMMON,
+				nullptr,
+				IID_PPV_ARGS(intermediateResources_[i].ReleaseAndGetAddressOf()));
+			if (FAILED(result)) {
+				logger::warn(
+					"[DLSS-NR Direct] Could not allocate pass {} intermediate {}x{} format={} result=0x{:08X}",
+					i + 1,
+					a_parameters.outputWidth,
+					a_parameters.outputHeight,
+					static_cast<std::uint32_t>(a_parameters.outputFormat),
+					static_cast<std::uint32_t>(result));
+				intermediateFailureLatched_ = true;
+				failedIntermediateWidth_ = a_parameters.outputWidth;
+				failedIntermediateHeight_ = a_parameters.outputHeight;
+				failedIntermediateFormat_ = a_parameters.outputFormat;
+				failedIntermediatePassCount_ = passCount;
+				return false;
+			}
+		}
+
+		intermediateWidth_ = a_parameters.outputWidth;
+		intermediateHeight_ = a_parameters.outputHeight;
+		intermediateFormat_ = a_parameters.outputFormat;
+		intermediateFailureLatched_ = false;
+		return true;
 	}
 
 	bool D3D12Backend::NeedsFeaturePreparation(const D3D12EvaluationParameters& a_parameters) const
 	{
-		const auto sameFailedConfiguration =
-			failedInputWidth_ == a_parameters.inputWidth &&
-			failedInputHeight_ == a_parameters.inputHeight &&
-			failedOutputWidth_ == a_parameters.outputWidth &&
-			failedOutputHeight_ == a_parameters.outputHeight &&
-			failedGuideWidth_ == a_parameters.guideWidth &&
-			failedGuideHeight_ == a_parameters.guideHeight &&
-			failedPerformanceMode_ == a_parameters.options.performanceMode &&
-			failedPreset_ == a_parameters.options.preset;
-		if (failureLatched_ && sameFailedConfiguration) {
-			return false;
+		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
+		if (!initialized_) {
+			return !initializationAttempted_;
 		}
-		return !initialized_ || !feature_ || NeedsFeatureRecreation(a_parameters) || failureLatched_;
+
+		if (passCount > 1) {
+			const auto sameFailedIntermediateConfiguration =
+				failedIntermediateWidth_ == a_parameters.outputWidth &&
+				failedIntermediateHeight_ == a_parameters.outputHeight &&
+				failedIntermediateFormat_ == a_parameters.outputFormat &&
+				failedIntermediatePassCount_ == passCount;
+			if (intermediateFailureLatched_ && sameFailedIntermediateConfiguration) {
+				return false;
+			}
+			if (intermediateWidth_ != a_parameters.outputWidth ||
+				intermediateHeight_ != a_parameters.outputHeight ||
+				intermediateFormat_ != a_parameters.outputFormat) {
+				return true;
+			}
+			for (std::uint32_t i = 0; i < passCount - 1; ++i) {
+				if (!intermediateResources_[i]) {
+					return true;
+				}
+			}
+		}
+
+		for (std::uint32_t i = 0; i < passCount; ++i) {
+			const auto& state = features_[i];
+			const auto sameFailedConfiguration =
+				state.failedInputWidth == a_parameters.inputWidth &&
+				state.failedInputHeight == a_parameters.inputHeight &&
+				state.failedOutputWidth == a_parameters.outputWidth &&
+				state.failedOutputHeight == a_parameters.outputHeight &&
+				state.failedGuideWidth == a_parameters.guideWidth &&
+				state.failedGuideHeight == a_parameters.guideHeight &&
+				state.failedPerformanceMode == a_parameters.options.performanceMode &&
+				state.failedPreset == a_parameters.options.preset;
+			if (state.failureLatched && sameFailedConfiguration) {
+				return false;
+			}
+			if (NeedsFeaturePreparation(state, a_parameters)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool D3D12Backend::PrepareFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
@@ -610,9 +751,6 @@ namespace nvngx::dlss_nr
 		if (!a_commandList || !a_parameters.inputWidth || !a_parameters.inputHeight ||
 			!a_parameters.outputWidth || !a_parameters.outputHeight) {
 			return false;
-		}
-		if (failureLatched_) {
-			failureLatched_ = false;
 		}
 		if (!initialized_) {
 			ID3D12Device* device = nullptr;
@@ -626,19 +764,26 @@ namespace nvngx::dlss_nr
 				return false;
 			}
 		}
-		if (!EnsureFeature(a_commandList, a_parameters)) {
-			failureLatched_ = true;
-			failedInputWidth_ = a_parameters.inputWidth;
-			failedInputHeight_ = a_parameters.inputHeight;
-			failedOutputWidth_ = a_parameters.outputWidth;
-			failedOutputHeight_ = a_parameters.outputHeight;
-			failedGuideWidth_ = a_parameters.guideWidth;
-			failedGuideHeight_ = a_parameters.guideHeight;
-			failedPerformanceMode_ = a_parameters.options.performanceMode;
-			failedPreset_ = a_parameters.options.preset;
+		if (!EnsureIntermediateResources(a_parameters)) {
 			return false;
 		}
 
+		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
+		for (std::uint32_t i = 0; i < passCount; ++i) {
+			auto& state = features_[i];
+			if (!EnsureFeature(state, a_commandList, a_parameters, i)) {
+				state.failureLatched = true;
+				state.failedInputWidth = a_parameters.inputWidth;
+				state.failedInputHeight = a_parameters.inputHeight;
+				state.failedOutputWidth = a_parameters.outputWidth;
+				state.failedOutputHeight = a_parameters.outputHeight;
+				state.failedGuideWidth = a_parameters.guideWidth;
+				state.failedGuideHeight = a_parameters.guideHeight;
+				state.failedPerformanceMode = a_parameters.options.performanceMode;
+				state.failedPreset = a_parameters.options.preset;
+				return false;
+			}
+		}
 		return true;
 	}
 
@@ -650,114 +795,190 @@ namespace nvngx::dlss_nr
 			!a_parameters.inputWidth || !a_parameters.inputHeight ||
 			!a_parameters.outputWidth || !a_parameters.outputHeight ||
 			!a_parameters.guideWidth || !a_parameters.guideHeight ||
-			!initialized_ || !feature_ || failureLatched_ || NeedsFeatureRecreation(a_parameters)) {
-			return false;
-		}
-		const auto reset = forceReset_ || a_parameters.reset;
-		SetEvaluationParameters(a_parameters, reset);
-
-		D3D12_RESOURCE_BARRIER beforeEvaluation[] = {
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.motionVectors, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-		};
-		a_commandList->ResourceBarrier(static_cast<UINT>(std::size(beforeEvaluation)), beforeEvaluation);
-		const auto evaluateResult = activeEvaluateFeature_(a_commandList, feature_, parameters_, nullptr);
-		D3D12_RESOURCE_BARRIER afterEvaluation[] = {
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.motionVectors, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-			CD3DX12_RESOURCE_BARRIER::Transition(a_parameters.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
-		};
-		a_commandList->ResourceBarrier(static_cast<UINT>(std::size(afterEvaluation)), afterEvaluation);
-
-		if (!IsNGXSuccess(evaluateResult)) {
-			const auto colorDesc = a_parameters.color->GetDesc();
-			const auto outputDesc = a_parameters.output->GetDesc();
-			logger::warn(
-				"[DLSS-NR Direct] EvaluateFeature failed result=0x{:08X} color={}x{} guides={}x{} output={}x{} colorResource={}x{} outputResource={}x{} performanceMode={} reset={}; disabling this configuration",
-				static_cast<std::uint32_t>(evaluateResult),
-				a_parameters.inputWidth,
-				a_parameters.inputHeight,
-				a_parameters.guideWidth,
-				a_parameters.guideHeight,
-				a_parameters.outputWidth,
-				a_parameters.outputHeight,
-				static_cast<std::uint32_t>(colorDesc.Width),
-				colorDesc.Height,
-				static_cast<std::uint32_t>(outputDesc.Width),
-				outputDesc.Height,
-				a_parameters.options.performanceMode,
-				reset);
-			// The failed call may still have recorded commands referencing the NGX
-			// feature. Keep it alive until a queue-drained recreation or shutdown.
-			failureLatched_ = true;
-			failedInputWidth_ = a_parameters.inputWidth;
-			failedInputHeight_ = a_parameters.inputHeight;
-			failedOutputWidth_ = a_parameters.outputWidth;
-			failedOutputHeight_ = a_parameters.outputHeight;
-			failedGuideWidth_ = a_parameters.guideWidth;
-			failedGuideHeight_ = a_parameters.guideHeight;
-			failedPerformanceMode_ = a_parameters.options.performanceMode;
-			failedPreset_ = a_parameters.options.preset;
+			!initialized_) {
+			lastEvaluatedPassCount_ = 0;
 			return false;
 		}
 
-		forceReset_ = false;
+		const auto requestedPassCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
+		const auto scratchMatches = [&](ID3D12Resource* a_resource) {
+			if (!a_resource) {
+				return false;
+			}
+			const auto desc = a_resource->GetDesc();
+			return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+				desc.Width == a_parameters.outputWidth &&
+				desc.Height == a_parameters.outputHeight &&
+				desc.Format == a_parameters.outputFormat &&
+				desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+				desc.SampleDesc.Count == 1 &&
+				(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+		};
+		std::uint32_t passCount = 0;
+		for (; passCount < requestedPassCount; ++passCount) {
+			const auto& state = features_[passCount];
+			if (!state.feature || !state.parameters || !state.activeEvaluateFeature || state.failureLatched ||
+				NeedsFeatureRecreation(state, a_parameters)) {
+				break;
+			}
+			if (passCount > 0 && !scratchMatches(intermediateResources_[passCount - 1].Get())) {
+				break;
+			}
+		}
+		if (passCount == 0) {
+			lastEvaluatedPassCount_ = 0;
+			return false;
+		}
+		if (passCount != requestedPassCount) {
+			const auto fallbackKey = (requestedPassCount << 8) | passCount;
+			if (loggedFallbackPassCount_ != fallbackKey) {
+				logger::warn(
+					"[DLSS-NR Direct] Requested {} passes but only {} prepared; using the available independent histories",
+					requestedPassCount,
+					passCount);
+				loggedFallbackPassCount_ = fallbackKey;
+			}
+		} else {
+			loggedFallbackPassCount_ = 0;
+		}
+
+		for (std::uint32_t pass = 0; pass < passCount; ++pass) {
+			auto& state = features_[pass];
+			auto passParameters = a_parameters;
+			passParameters.color = pass == 0 ? a_parameters.color : intermediateResources_[pass - 1].Get();
+			passParameters.output = pass + 1 == passCount ? a_parameters.output : intermediateResources_[pass].Get();
+			if (pass > 0) {
+				// Avoid compounding local tone remapping across independent histories.
+				passParameters.options.localToneStrength = 0.0f;
+			}
+
+			const auto reset = state.forceReset || a_parameters.reset;
+#ifdef UPSCALING_NR_CAPTURE
+			if (NRDiagnosticCapture::Requested()) {
+				NRDiagnosticCapture::Annotate(a_commandList,
+					std::format("\"nr_pass_{}\":{{\"reset\":{},\"mv_scale\":[{},{}],\"local_structure\":{},\"local_tone\":{}}}",
+						pass + 1, reset, passParameters.motionVectorScaleX, passParameters.motionVectorScaleY,
+						passParameters.options.localStructureStrength, passParameters.options.localToneStrength));
+			}
+#endif
+			SetEvaluationParameters(state.parameters, passParameters, reset);
+			D3D12_RESOURCE_BARRIER beforeEvaluation[] = {
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.motionVectors, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+			};
+			a_commandList->ResourceBarrier(static_cast<UINT>(std::size(beforeEvaluation)), beforeEvaluation);
+			const auto evaluateResult = state.activeEvaluateFeature(
+				a_commandList,
+				state.feature,
+				state.parameters,
+				nullptr);
+			D3D12_RESOURCE_BARRIER afterEvaluation[] = {
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.motionVectors, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				CD3DX12_RESOURCE_BARRIER::Transition(passParameters.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+			};
+			a_commandList->ResourceBarrier(static_cast<UINT>(std::size(afterEvaluation)), afterEvaluation);
+
+			if (!IsNGXSuccess(evaluateResult)) {
+				const auto colorDesc = passParameters.color->GetDesc();
+				const auto outputDesc = passParameters.output->GetDesc();
+				logger::warn(
+					"[DLSS-NR Direct] EvaluateFeature failed pass={} result=0x{:08X} color={}x{} guides={}x{} output={}x{} colorResource={}x{} outputResource={}x{} performanceMode={} reset={}; using original color for SR",
+					pass + 1,
+					static_cast<std::uint32_t>(evaluateResult),
+					passParameters.inputWidth,
+					passParameters.inputHeight,
+					passParameters.guideWidth,
+					passParameters.guideHeight,
+					passParameters.outputWidth,
+					passParameters.outputHeight,
+					static_cast<std::uint32_t>(colorDesc.Width),
+					colorDesc.Height,
+					static_cast<std::uint32_t>(outputDesc.Width),
+					outputDesc.Height,
+					passParameters.options.performanceMode,
+					reset);
+				state.failureLatched = true;
+				state.failedInputWidth = passParameters.inputWidth;
+				state.failedInputHeight = passParameters.inputHeight;
+				state.failedOutputWidth = passParameters.outputWidth;
+				state.failedOutputHeight = passParameters.outputHeight;
+				state.failedGuideWidth = passParameters.guideWidth;
+				state.failedGuideHeight = passParameters.guideHeight;
+				state.failedPerformanceMode = passParameters.options.performanceMode;
+				state.failedPreset = passParameters.options.preset;
+				RequestReset();
+				lastEvaluatedPassCount_ = 0;
+				return false;
+			}
+			state.forceReset = false;
+		}
+		lastEvaluatedPassCount_ = passCount;
 		return true;
 	}
 
 	void D3D12Backend::RequestReset()
 	{
-		forceReset_ = true;
+		for (auto& state : features_) {
+			state.forceReset = true;
+		}
 	}
 
-	bool D3D12Backend::ReleaseFeature()
+	bool D3D12Backend::ReleaseFeature(FeatureState& a_state)
 	{
 		// A failed release must not make this feature eligible for evaluation.
-		featureInputWidth_ = 0;
-		if (feature_) {
-			if (!activeReleaseFeature_) {
+		a_state.inputWidth = 0;
+		if (a_state.feature) {
+			if (!a_state.activeReleaseFeature) {
 				return false;
 			}
-			const auto result = activeReleaseFeature_(feature_);
+			const auto result = a_state.activeReleaseFeature(a_state.feature);
 			if (!IsNGXSuccess(result)) {
 				logger::warn("[DLSS-NR Direct] ReleaseFeature failed result=0x{:08X}", static_cast<std::uint32_t>(result));
 				return false;
 			}
 		}
-		feature_ = nullptr;
-		activeEvaluateFeature_ = nullptr;
-		activeReleaseFeature_ = nullptr;
+		a_state.feature = nullptr;
+		a_state.activeEvaluateFeature = nullptr;
+		a_state.activeReleaseFeature = nullptr;
 
-		if (parameters_) {
+		if (a_state.parameters) {
 			if (!destroyParameters_) {
 				return false;
 			}
-			const auto result = destroyParameters_(parameters_);
+			const auto result = destroyParameters_(a_state.parameters);
 			if (!IsNGXSuccess(result)) {
 				logger::warn("[DLSS-NR Direct] DestroyParameters failed result=0x{:08X}", static_cast<std::uint32_t>(result));
 				return false;
 			}
 		}
-		parameters_ = nullptr;
-		featureInputWidth_ = 0;
-		featureInputHeight_ = 0;
-		featureOutputWidth_ = 0;
-		featureOutputHeight_ = 0;
-		featurePerformanceMode_ = 0;
-		featurePreset_ = 0;
-		failureLatched_ = false;
-		failedInputWidth_ = 0;
-		failedInputHeight_ = 0;
-		failedOutputWidth_ = 0;
-		failedOutputHeight_ = 0;
-		failedGuideWidth_ = 0;
-		failedGuideHeight_ = 0;
-		failedPerformanceMode_ = 0;
-		failedPreset_ = 0;
-		forceReset_ = true;
+		a_state = {};
+		return true;
+	}
+
+	bool D3D12Backend::ReleaseFeature()
+	{
+		for (auto& state : features_) {
+			if (!ReleaseFeature(state)) {
+				return false;
+			}
+		}
+		for (auto& resource : intermediateResources_) {
+			resource.Reset();
+		}
+		intermediateWidth_ = 0;
+		intermediateHeight_ = 0;
+		intermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+		intermediateFailureLatched_ = false;
+		failedIntermediateWidth_ = 0;
+		failedIntermediateHeight_ = 0;
+		failedIntermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+		failedIntermediatePassCount_ = 0;
+		loggedFallbackPassCount_ = 0;
+		lastEvaluatedPassCount_ = 0;
 		return true;
 	}
 
@@ -795,8 +1016,6 @@ namespace nvngx::dlss_nr
 		snippetCreateFeature_ = nullptr;
 		snippetEvaluateFeature_ = nullptr;
 		snippetReleaseFeature_ = nullptr;
-		activeEvaluateFeature_ = nullptr;
-		activeReleaseFeature_ = nullptr;
 		shutdown_ = nullptr;
 		initializationAttempted_ = false;
 	}

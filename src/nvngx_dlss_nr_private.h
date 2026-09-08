@@ -8,7 +8,9 @@
 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
+#include <wrl/client.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 
@@ -95,6 +97,8 @@ namespace nvngx::dlss_nr
 		float motionVectorScaleY = 1.0f;
 		bool depthInverted = false;
 		bool reset = false;
+		std::uint32_t passCount = 1;
+		DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
 		Options options{};
 	};
 
@@ -116,6 +120,7 @@ namespace nvngx::dlss_nr
 		// Caller drains submitted work before this lifecycle-only recording step.
 		bool PrepareFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		bool Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
+		std::uint32_t GetLastEvaluatedPassCount() const { return lastEvaluatedPassCount_; }
 		void RequestReset();
 		bool ReleaseFeature();
 		void Shutdown();
@@ -129,12 +134,40 @@ namespace nvngx::dlss_nr
 		using PFun_ReleaseFeature = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Handle*);
 		using PFun_Shutdown = NVSDK_NGX_Result(NVSDK_CONV*)(ID3D12Device*);
 
+		struct FeatureState
+		{
+			NVSDK_NGX_Parameter* parameters = nullptr;
+			NVSDK_NGX_Handle* feature = nullptr;
+			PFun_EvaluateFeature activeEvaluateFeature = nullptr;
+			PFun_ReleaseFeature activeReleaseFeature = nullptr;
+			bool forceReset = true;
+			std::uint32_t inputWidth = 0;
+			std::uint32_t inputHeight = 0;
+			std::uint32_t outputWidth = 0;
+			std::uint32_t outputHeight = 0;
+			std::uint32_t performanceMode = 0;
+			std::uint32_t preset = 0;
+			bool failureLatched = false;
+			std::uint32_t failedInputWidth = 0;
+			std::uint32_t failedInputHeight = 0;
+			std::uint32_t failedOutputWidth = 0;
+			std::uint32_t failedOutputHeight = 0;
+			std::uint32_t failedGuideWidth = 0;
+			std::uint32_t failedGuideHeight = 0;
+			std::uint32_t failedPerformanceMode = 0;
+			std::uint32_t failedPreset = 0;
+		};
+
 		bool LoadRuntime();
 		bool InstallModuleNameHook();
 		void RestoreModuleNameHook();
-		bool EnsureFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
-		void SetCreationParameters(const D3D12EvaluationParameters& a_parameters);
-		void SetEvaluationParameters(const D3D12EvaluationParameters& a_parameters, bool a_reset);
+		bool EnsureFeature(FeatureState& a_state, ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters, std::uint32_t a_passIndex);
+		bool EnsureIntermediateResources(const D3D12EvaluationParameters& a_parameters);
+		bool NeedsFeatureRecreation(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const;
+		bool NeedsFeaturePreparation(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const;
+		bool ReleaseFeature(FeatureState& a_state);
+		void SetCreationParameters(NVSDK_NGX_Parameter* a_parameters, const D3D12EvaluationParameters& a_evaluationParameters);
+		void SetEvaluationParameters(NVSDK_NGX_Parameter* a_parameters, const D3D12EvaluationParameters& a_evaluationParameters, bool a_reset);
 
 		std::filesystem::path runtimeDirectory_;
 		HMODULE runtime_ = nullptr;
@@ -143,26 +176,21 @@ namespace nvngx::dlss_nr
 		std::uintptr_t* moduleNameImportSlot_ = nullptr;
 		std::uintptr_t originalModuleNameImport_ = 0;
 		ID3D12Device* device_ = nullptr;
-		NVSDK_NGX_Parameter* parameters_ = nullptr;
-		NVSDK_NGX_Handle* feature_ = nullptr;
 		bool initializationAttempted_ = false;
 		bool initialized_ = false;
-		bool forceReset_ = true;
-		std::uint32_t featureInputWidth_ = 0;
-		std::uint32_t featureInputHeight_ = 0;
-		std::uint32_t featureOutputWidth_ = 0;
-		std::uint32_t featureOutputHeight_ = 0;
-		std::uint32_t featurePerformanceMode_ = 0;
-		std::uint32_t featurePreset_ = 0;
-		bool failureLatched_ = false;
-		std::uint32_t failedInputWidth_ = 0;
-		std::uint32_t failedInputHeight_ = 0;
-		std::uint32_t failedOutputWidth_ = 0;
-		std::uint32_t failedOutputHeight_ = 0;
-		std::uint32_t failedGuideWidth_ = 0;
-		std::uint32_t failedGuideHeight_ = 0;
-		std::uint32_t failedPerformanceMode_ = 0;
-		std::uint32_t failedPreset_ = 0;
+		static constexpr std::uint32_t kMaxPassCount = 3;
+		std::array<FeatureState, kMaxPassCount> features_{};
+		std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kMaxPassCount - 1> intermediateResources_{};
+		std::uint32_t intermediateWidth_ = 0;
+		std::uint32_t intermediateHeight_ = 0;
+		DXGI_FORMAT intermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+		bool intermediateFailureLatched_ = false;
+		std::uint32_t failedIntermediateWidth_ = 0;
+		std::uint32_t failedIntermediateHeight_ = 0;
+		DXGI_FORMAT failedIntermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+		std::uint32_t failedIntermediatePassCount_ = 0;
+		std::uint32_t loggedFallbackPassCount_ = 0;
+		std::uint32_t lastEvaluatedPassCount_ = 0;
 
 		PFun_InitExt initExt_ = nullptr;
 		PFun_AllocateParameters allocateParameters_ = nullptr;
@@ -173,8 +201,6 @@ namespace nvngx::dlss_nr
 		PFun_CreateFeature snippetCreateFeature_ = nullptr;
 		PFun_EvaluateFeature snippetEvaluateFeature_ = nullptr;
 		PFun_ReleaseFeature snippetReleaseFeature_ = nullptr;
-		PFun_EvaluateFeature activeEvaluateFeature_ = nullptr;
-		PFun_ReleaseFeature activeReleaseFeature_ = nullptr;
 		PFun_Shutdown shutdown_ = nullptr;
 	};
 }

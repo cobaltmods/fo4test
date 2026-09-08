@@ -135,7 +135,7 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
+	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
 
 	/**
 	 * @brief Update Streamline constants for current frame
@@ -292,6 +292,7 @@ private:
 	bool EnsureD3D12DLSSNROptions(sl::DLSSMode a_mode, const sl::DLSSNROptions& a_options);
 	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
+	bool ValidateConstantsForFrame(sl::FrameToken* a_frameToken);
 	void ResetOptionCaches();
 	void SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameToken = nullptr);
 	bool DisableDLSSGNow();
@@ -300,6 +301,10 @@ private:
 	uint32_t lastTemporalResetFrameIndex = std::numeric_limits<uint32_t>::max();
 	const void* constantsReferenceCamera = nullptr;
 	bool temporalResetPending = true;
+	uint32_t constantsTokenIndex = std::numeric_limits<uint32_t>::max();
+	float2 constantsJitter{};
+	bool srInputHistoryValid = false;
+	uint32_t srInputNRPassCount = 0;
 	uint32_t markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	uint32_t reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
@@ -332,6 +337,7 @@ private:
 	bool currentD3D12DLSSNROptionsValid = false;
 	sl::DLSSNROptions currentD3D12DLSSNROptions{};
 	bool currentNISOptionsValid = false;
+	bool nisResourcesUsed = false;
 	float currentNISSharpness = -1.0f;
 	uint32_t pclStatsWindowMessage = 0;
 	uint32_t pclPingCount = 0;
@@ -339,6 +345,7 @@ private:
 	bool pendingDLSSGDisable = false;
 	uint32_t dlssgPresentSafetyFrames = 0;
 	bool loggedDLSSNRFallback = false;
+	bool loggedNativeDLSSNRMultipass = false;
 	bool dlssNRSuspended = false;
 	nvngx::dlss_nr::D3D12Backend directDLSSNR;
 };

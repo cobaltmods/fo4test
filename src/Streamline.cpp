@@ -1,4 +1,7 @@
 #include "Streamline.h"
+#ifdef UPSCALING_NR_CAPTURE
+#include "NRDiagnosticCapture.h"
+#endif
 #include "Upscaling.h"
 
 #include "third_party/RTX40MFGUnlock/integration.h"
@@ -332,6 +335,7 @@ void Streamline::Shutdown()
 	swapChain = nullptr;
 	swapChainDesc = {};
 	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
+	constantsTokenIndex = std::numeric_limits<uint32_t>::max();
 	lastConstantsFrameIndex = std::numeric_limits<uint32_t>::max();
 	lastTemporalResetFrameIndex = std::numeric_limits<uint32_t>::max();
 	constantsReferenceCamera = nullptr;
@@ -553,7 +557,6 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 
 	markerFrameIndex = a_frameIndex;
 	currentFrameTokenIndex = static_cast<uint32_t>(*frameToken);
-	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
 
 	return true;
 }
@@ -608,9 +611,22 @@ void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 
 void Streamline::RequestTemporalReset()
 {
+	// Published common constants are immutable for their token. A late request
+	// is consumed by UpdateConstants on the next frame, never by republishing.
 	temporalResetPending = true;
-	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
 	directDLSSNR.RequestReset();
+}
+
+bool Streamline::ValidateConstantsForFrame(sl::FrameToken* a_frameToken)
+{
+	// Compare token IDs, not engine frame counters, to the published snapshot.
+	if (!a_frameToken || !frameToken ||
+		static_cast<uint32_t>(*a_frameToken) != static_cast<uint32_t>(*frameToken) ||
+		constantsTokenIndex != static_cast<uint32_t>(*a_frameToken)) {
+		logger::warn("[Streamline] Temporal evaluation rejected: constants/token mismatch");
+		return false;
+	}
+	return true;
 }
 
 sl::FrameToken* Streamline::GetFrameTokenForFrame(uint32_t a_frameIndex)
@@ -1144,6 +1160,8 @@ float Streamline::GetReflexLatencyMs()
 void Streamline::ResetOptionCaches()
 {
 	RequestTemporalReset();
+	srInputHistoryValid = false;
+	srInputNRPassCount = 0;
 	currentD3D12DLSSOptionsValid = false;
 	currentD3D12DLSSMode = sl::DLSSMode::eOff;
 	currentD3D12DLSSOutputWidth = 0;
@@ -1171,6 +1189,10 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	dlssOptions.outputWidth = a_outputWidth;
 	dlssOptions.outputHeight = a_outputHeight;
 	dlssOptions.colorBuffersHDR = sl::Boolean::eFalse;
+	// Color is post-imagespace LDR, not the engine's pre-tonemap HDR buffer.
+	dlssOptions.preExposure = 1.0f;
+	dlssOptions.exposureScale = 1.0f;
+	dlssOptions.useAutoExposure = sl::Boolean::eTrue;
 	ApplyDLSSModelPreset(dlssOptions, a_dlssModelPreset);
 
 	if (SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions))) {
@@ -1271,6 +1293,7 @@ bool Streamline::ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a
 		return false;
 	}
 
+	nisResourcesUsed = true;
 	return true;
 }
 
@@ -1304,10 +1327,11 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 		return false;
 	}
 
+	nisResourcesUsed = true;
 	return true;
 }
 
-bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
+bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
 {
 	if (a_sharpened) {
 		*a_sharpened = false;
@@ -1324,6 +1348,32 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			static_cast<void*>(a_depth),
 			static_cast<void*>(a_commandList),
 			static_cast<void*>(a_frameToken));
+		return false;
+	}
+
+	const auto validSize = [](float2 size) {
+		return std::isfinite(size.x) && std::isfinite(size.y) &&
+			size.x >= 1.0f && size.y >= 1.0f && size.x <= 16384.0f && size.y <= 16384.0f;
+	};
+	const auto covers = [](ID3D12Resource* resource, float2 size, bool output) {
+		if (!resource) { return false; }
+		const auto desc = resource->GetDesc();
+		return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+			desc.SampleDesc.Count == 1 && desc.DepthOrArraySize == 1 &&
+			desc.Width >= static_cast<uint32_t>(size.x) && desc.Height >= static_cast<uint32_t>(size.y) &&
+			(!output || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0);
+	};
+	if (!validSize(a_renderSize) || !validSize(a_displaySize) ||
+		a_renderSize.x > a_displaySize.x || a_renderSize.y > a_displaySize.y ||
+		(a_qualityMode == 0 && (a_renderSize.x != a_displaySize.x || a_renderSize.y != a_displaySize.y)) ||
+		!covers(a_color, a_renderSize, false) || !covers(a_depth, a_renderSize, false) ||
+		!covers(a_motionVectors, a_renderSize, false) || !covers(a_outputColor, a_displaySize, true) ||
+		(a_sharpenedOutput && !covers(a_sharpenedOutput, a_displaySize, true)) ||
+		a_color == a_outputColor || (a_sharpenedOutput &&
+			(a_sharpenedOutput == a_color || a_sharpenedOutput == a_outputColor))) {
+		logger::warn("[Streamline] DLSS resource/extent contract rejected render={}x{} display={}x{} quality={}",
+			a_renderSize.x, a_renderSize.y, a_displaySize.x, a_displaySize.y, a_qualityMode);
+		RequestTemporalReset();
 		return false;
 	}
 
@@ -1391,6 +1441,9 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		}
 
 		const auto inputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftInputColor : sl::kBufferTypeScalingInputColor;
+		if (!ValidateConstantsForFrame(a_frameToken)) {
+			return false;
+		}
 		const auto outputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftOutputColor : sl::kBufferTypeScalingOutputColor;
 		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_featureColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_featureOutput, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
@@ -1460,13 +1513,22 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		// discovery rejected the private runtime, use the feature DLL directly;
 		// do not retry a failed evaluation through the other NR backend.
 		if (featureDLSSNR && slDLSSNRSetOptions) {
+			if (a_dlssNRPassCount > 1 && !loggedNativeDLSSNRMultipass) {
+				logger::info("[Streamline] DLSS-NR multipass is only available on the direct-NGX path; using one Streamline NR pass");
+				loggedNativeDLSSNRMultipass = true;
+			} else if (a_dlssNRPassCount <= 1) {
+				loggedNativeDLSSNRMultipass = false;
+			}
 			return evaluate(true, a_color, a_outputColor, lowResExtent, lowResExtent);
 		}
+		loggedNativeDLSSNRMultipass = false;
 
 		nvngx::dlss_nr::D3D12EvaluationParameters parameters{};
+		// Never silently feed raw UV motion to NR if conversion failed.
+		if (!a_nrMotionVectors) { return false; }
 		parameters.color = a_color;
 		parameters.output = a_outputColor;
-		parameters.motionVectors = a_motionVectors;
+		parameters.motionVectors = a_nrMotionVectors;
 		parameters.depth = a_depth;
 		parameters.inputWidth = lowResExtent.width;
 		parameters.inputHeight = lowResExtent.height;
@@ -1474,9 +1536,16 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.outputHeight = lowResExtent.height;
 		parameters.guideWidth = lowResExtent.width;
 		parameters.guideHeight = lowResExtent.height;
+		// The NR-only texture already contains pixel displacement and the
+		// previous-current sample jitter delta. Do not scale it a second time.
 		parameters.motionVectorScaleX = 1.0f;
 		parameters.motionVectorScaleY = 1.0f;
 		parameters.depthInverted = false;
+		parameters.passCount = std::clamp(a_dlssNRPassCount, 1u, 3u);
+		parameters.outputFormat = a_colorFormat;
+		if (!ValidateConstantsForFrame(a_frameToken)) {
+			return false;
+		}
 		parameters.reset = lastTemporalResetFrameIndex == constantsFrameIndex;
 		parameters.options.performanceMode = a_dlssNROptions.performanceMode == 0 ?
 			DLSSNRPerformanceMode(dlssMode) : a_dlssNROptions.performanceMode;
@@ -1491,14 +1560,42 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	};
 
 	const bool dlssNRRequested = !dlssNRSuspended && a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
+#ifdef UPSCALING_NR_CAPTURE
+	const bool capture = NRDiagnosticCapture::Requested() && dlssNRRequested && a_sharpenedOutput &&
+		ValidateConstantsForFrame(a_frameToken) && NRDiagnosticCapture::Begin(a_commandList, constantsFrameIndex,
+			std::format("\"engine_frame\":{},\"token\":{},\"render\":[{},{}],\"display\":[{},{}],\"jitter\":[{},{}],\"common_reset\":{},\"direct_ngx\":{},\"requested_passes\":{},\"quality\":{},\"style\":{},\"intensity\":{},\"local_tone\":{},\"local_structure\":{},\"skin_structure\":{},\"auto_mask\":{}",
+				constantsFrameIndex, static_cast<uint32_t>(*a_frameToken), lowResExtent.width, lowResExtent.height,
+				fullExtent.width, fullExtent.height, constantsJitter.x, constantsJitter.y,
+				lastTemporalResetFrameIndex == constantsFrameIndex, !(featureDLSSNR && slDLSSNRSetOptions),
+				a_dlssNRPassCount, a_qualityMode, a_dlssNROptions.style, a_dlssNROptions.intensity,
+				a_dlssNROptions.localToneStrength, a_dlssNROptions.localStructureStrength,
+				a_dlssNROptions.skinStructureStrength, a_dlssNROptions.useAutoMask == sl::Boolean::eTrue));
+	if (capture) {
+		NRDiagnosticCapture::Copy(a_commandList, "input", a_color, lowResExtent.width, lowResExtent.height);
+		NRDiagnosticCapture::Copy(a_commandList, "mv", a_motionVectors, lowResExtent.width, lowResExtent.height);
+		NRDiagnosticCapture::Copy(a_commandList, "depth", a_depth, lowResExtent.width, lowResExtent.height);
+		if (!(featureDLSSNR && slDLSSNRSetOptions) && a_nrMotionVectors) {
+			NRDiagnosticCapture::Copy(a_commandList, "nr_mv", a_nrMotionVectors, lowResExtent.width, lowResExtent.height);
+			NRDiagnosticCapture::Annotate(a_commandList,
+				std::format("\"nr_mv_encoding\":\"pixels_with_jitter\",\"nr_jitter_delta\":[{},{}]", a_nrJitterDelta.x, a_nrJitterDelta.y));
+		}
+	}
+#endif
+	// The jitter delta is capture metadata; NR consumes the corrected texture.
+	(void)a_nrJitterDelta;
 	bool neuralRendered = false;
+	uint32_t evaluatedNRPassCount = 0;
 	if (dlssNRRequested && a_sharpenedOutput) {
 		neuralRendered = evaluateDLSSNR();
 		if (neuralRendered) {
+			evaluatedNRPassCount = featureDLSSNR && slDLSSNRSetOptions ? 1u : directDLSSNR.GetLastEvaluatedPassCount();
 			// The signed 310.8 NR runtime is a 1:1 pass. Order its UAV writes before
 			// the same top-left subrect is consumed as the DLSS SR color input.
 			auto nrToSRBarrier = CD3DX12_RESOURCE_BARRIER::UAV(a_outputColor);
 			a_commandList->ResourceBarrier(1, &nrToSRBarrier);
+#ifdef UPSCALING_NR_CAPTURE
+			if (capture) { NRDiagnosticCapture::Copy(a_commandList, "nr", a_outputColor, lowResExtent.width, lowResExtent.height); }
+#endif
 		} else {
 			if (!loggedDLSSNRFallback) {
 				logger::warn("[Streamline] D3D12 DLSS-NR failed; running DLSS SR from the original color input");
@@ -1517,9 +1614,27 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	// display-resolution scene used by presentation and frame generation.
 	auto* srInput = neuralRendered ? a_outputColor : a_color;
 	auto* srOutput = neuralRendered ? a_sharpenedOutput : a_outputColor;
+	if (srInputHistoryValid && srInputNRPassCount != evaluatedNRPassCount) {
+		// A failed/recovered NR pass changes SR's signal even without a setting
+		// change. Do not blend the original frame with NR's altered appearance.
+		RequestTemporalReset();
+	}
 	if (!evaluate(false, srInput, srOutput, lowResExtent, fullExtent)) {
+#ifdef UPSCALING_NR_CAPTURE
+		if (capture) { NRDiagnosticCapture::Finish(a_commandList, neuralRendered, false, evaluatedNRPassCount); }
+#endif
+		srInputHistoryValid = false;
+		RequestTemporalReset();
 		return false;
 	}
+	srInputNRPassCount = evaluatedNRPassCount;
+#ifdef UPSCALING_NR_CAPTURE
+	if (capture) {
+		NRDiagnosticCapture::Copy(a_commandList, "sr", srOutput, fullExtent.width, fullExtent.height);
+		NRDiagnosticCapture::Finish(a_commandList, neuralRendered, true, evaluatedNRPassCount);
+	}
+#endif
+	srInputHistoryValid = true;
 	if (neuralRendered) {
 		loggedDLSSNRFallback = false;
 		if (a_sharpened) {
@@ -1546,16 +1661,15 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 	}
 
 	const auto currentFrameIndex = gameViewport->frameCount;
-	if (constantsFrameIndex == currentFrameIndex && frameToken) {
+	if (!EnsureFrameToken(currentFrameIndex)) {
+		return false;
+	}
+	if (constantsTokenIndex == static_cast<uint32_t>(*frameToken)) {
 		return true;
 	}
 	if (lastConstantsFrameIndex != std::numeric_limits<uint32_t>::max() &&
 		currentFrameIndex != lastConstantsFrameIndex + 1) {
 		RequestTemporalReset();
-	}
-
-	if (!EnsureFrameToken(currentFrameIndex)) {
-		return false;
 	}
 
 	const auto cameraProjection = Util::GetCameraProjection();
@@ -1633,7 +1747,10 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 	slConstants.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	slConstants.motionVectors3D = sl::Boolean::eFalse;
 	slConstants.orthographicProjection = sl::Boolean::eFalse;
-	slConstants.motionVectorsDilated = sl::Boolean::eTrue;
+	// The normal path copies engine MV (with first-person repair), not a
+	// complete nearest-depth dilation. The fallback's selective 5x5 filter
+	// also does not satisfy the fully-dilated contract.
+	slConstants.motionVectorsDilated = sl::Boolean::eFalse;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
 
 	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, viewport))) {
@@ -1650,6 +1767,8 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 	}
 
 	constantsFrameIndex = currentFrameIndex;
+	constantsJitter = { slConstants.jitterOffset.x, slConstants.jitterOffset.y };
+	constantsTokenIndex = static_cast<uint32_t>(*frameToken);
 	lastConstantsFrameIndex = currentFrameIndex;
 	constantsReferenceCamera = cameraState->referenceCamera;
 	if (resetHistory) {
@@ -1679,6 +1798,14 @@ bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D1
 	a_parameters.options.performanceMode = requested == 0 ? modes[quality < std::size(modes) ? quality : 0] :
 		requested == 5 ? 6 : requested;
 	a_parameters.options.preset = upscaling->settings.dlssNRPreset;
+	a_parameters.options.style = upscaling->settings.dlssNRStyle;
+	a_parameters.options.intensity = upscaling->settings.dlssNRIntensity;
+	a_parameters.options.localToneStrength = upscaling->settings.dlssNRLocalToneStrength;
+	a_parameters.options.localStructureStrength = upscaling->settings.dlssNRLocalStructureStrength;
+	a_parameters.options.skinStructureStrength = upscaling->settings.dlssNRSkinStructureStrength;
+	a_parameters.options.useAutoMask = upscaling->settings.dlssNRUseAutoMask != 0;
+	a_parameters.passCount = std::clamp(upscaling->settings.dlssNRPassCount, 1u, 3u);
+	a_parameters.outputFormat = upscaling->dlssD3D12ColorFormats[a_slot];
 	return directDLSSNR.NeedsFeaturePreparation(a_parameters);
 }
 
@@ -1715,6 +1842,8 @@ void Streamline::DisableDLSS()
 void Streamline::DestroyDLSSResources()
 {
 	RequestTemporalReset();
+	srInputHistoryValid = false;
+	srInputNRPassCount = 0;
 	DisableDLSS();
 	directDLSSNR.ReleaseFeature();
 
@@ -1732,6 +1861,18 @@ void Streamline::DestroyDLSSResources()
 			logger::warn("[Streamline] Could not free DLSS-NR resources: {}", magic_enum::enum_name(result));
 		}
 	}
+	if (featureNIS && nisResourcesUsed) {
+		// This teardown is called after the queue drain. NIS caches resource
+		// descriptions by native pointer; recycled texture addresses otherwise
+		// retain stale dimensions after scene/quality resource recreation.
+		if (SL_FAILED(result, slFreeResources(sl::kFeatureNIS, viewport))) {
+			logger::warn("[Streamline] Could not clear NIS resource cache: {}", magic_enum::enum_name(result));
+		} else {
+			nisResourcesUsed = false;
+		}
+	}
+	currentNISOptionsValid = false;
+	currentNISSharpness = -1.0f;
 }
 
 void Streamline::SuspendDLSSNR()

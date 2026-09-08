@@ -90,6 +90,7 @@ public:
 		uint reflexMode = 1;                                        ///< Reflex mode: 0=Off, 1=On, 2=On + Boost
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
 		uint dlssNREnabled = 1;                                     ///< Prefer DLSS-NR uplift over DLSS SR when available
+		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
 		uint dlssNRPerformanceMode = 0;                             ///< 0=Follow quality mode, 1..4=NGX modes, 5=DLAA
 		uint dlssNRPreset = 0;                                      ///< DLSS-NR preset: 0=Default, 1..3=preview presets
 		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic
@@ -416,6 +417,23 @@ public:
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgHUDLessSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgMotionVectorSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgDepthSharedTextures;
+	// Unmodified engine guides for NR/SR, independent of FG's first-person repair.
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssMotionVectorSharedTextures;
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssDepthSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssMotionVectorD3D12;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssDepthD3D12;
+	// NR consumes pixel displacement including the sample-position jitter delta.
+	// SR/FG continue to use their original, separate guide resources.
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> nrMotionSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> nrMotionD3D12;
+	std::array<bool, kDX12FrameCount> nrMotionReady{};
+	std::array<float2, kDX12FrameCount> nrMotionJitterDeltas{};
+	winrt::com_ptr<ID3D11ComputeShader> nrMotionCS;
+	winrt::com_ptr<ID3D11Buffer> nrMotionConstants;
+	bool nrMotionHistoryValid = false;
+	uint32_t nrMotionPreviousFrame = 0;
+	float2 nrMotionPreviousJitter{}, nrMotionPreviousSize{}, nrMotionCurrentDelta{};
+	bool CaptureNRMotion(UINT slot, UINT width, UINT height);
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssTransparencyMaskSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrInputSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrOutputSharedTextures;

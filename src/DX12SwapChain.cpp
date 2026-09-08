@@ -1,4 +1,7 @@
 #include "DX12SwapChain.h"
+#ifdef UPSCALING_NR_CAPTURE
+#include "NRDiagnosticCapture.h"
+#endif
 #include "ENBRenderDomain.h"
 #include "ENBTiledLighting.h"
 #include "NativeInterfaceUI.h"
@@ -1255,6 +1258,9 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 		DX::ThrowIfFailed(signalResult);
 	}
 	a_context.fenceValue = signalValue;
+#ifdef UPSCALING_NR_CAPTURE
+	NRDiagnosticCapture::Submitted(a_context.list.get(), commandFence.get(), signalValue);
+#endif
 }
 
 void DX12SwapChain::WaitForFrameStart()
@@ -2131,9 +2137,9 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		// Even an unsuccessful NGX creation may record GPU work. Submit and
 		// fence it rather than resetting/releasing an apparently idle context.
 		ExecuteCommandContext(initialization);
-		logger::info("[DLSS-NR Direct] Preparation submitted ready={} input={}x{} mode={} fence={}",
+		logger::info("[DLSS-NR Direct] Preparation submitted ready={} input={}x{} mode={} passes={} fence={}",
 			prepared, nrPreparation.inputWidth, nrPreparation.inputHeight,
-			nrPreparation.options.performanceMode, initialization.fenceValue);
+			nrPreparation.options.performanceMode, nrPreparation.passCount, initialization.fenceValue);
 	}
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
