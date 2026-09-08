@@ -1275,6 +1275,17 @@ void DX12SwapChain::ConfigureFrameLatency()
 	frameLatencyEvent.close();
 	frameLatencyFrameValid = false;
 	if (!swapChain) { return; }
+	const auto* streamline = Streamline::GetSingleton();
+	if (streamline->UsesD3D12() && streamline->featureDLSSG &&
+		!FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive()) {
+		// The SL proxy forwards the latency event to its underlying swapchain.
+		// DuplicateHandle shares that event's signal; it does not create another
+		// notification for us. Leave queue throttling to the DLSS-G presenter,
+		// which remains installed even while generation is Off. A second waiter
+		// can starve its flip-queue wait (30ms timeouts with VSync enabled).
+		logger::info("[Presentation] Streamline owns DXGI queue pacing, including FG Off; retaining pre-input FPS limiter and fence pacing");
+		return;
+	}
 	const auto result = swapChain->SetMaximumFrameLatency(1);
 	if (FAILED(result)) {
 		logger::warn("[Presentation] SetMaximumFrameLatency(1) failed hr=0x{:08X}; retaining fence pacing", static_cast<uint32_t>(result));
