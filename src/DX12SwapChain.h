@@ -232,6 +232,12 @@ private:
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	PresentPacing presentPacing;
+	void ConfigureFrameLatency();
+	void WaitForPresentationCapacity(uint32_t frame);
+	std::mutex frameLatencyMutex;
+	winrt::handle frameLatencyEvent;
+	uint32_t frameLatencyFrame = 0;
+	bool frameLatencyFrameValid = false;
 	HWND hwnd = nullptr;
 	WNDPROC originalWndProc = nullptr;
 	std::atomic_bool windowMinimized{ false };

@@ -405,6 +405,7 @@ namespace
 		desc.Format = a_swapChainDesc.BufferDesc.Format;
 		desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 		desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 		desc.SampleDesc.Count = 1;
 
 		RECT clientRect{};
@@ -724,6 +725,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 	if (!swapChainIsStreamlineProxy) {
 		logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
 	}
+	ConfigureFrameLatency();
 	RefreshBackBuffers();
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 	swapChainProxy = new DXGISwapChainProxy(swapChain.get());
@@ -1078,6 +1080,7 @@ HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_wi
 		return result;
 	}
 
+	ConfigureFrameLatency();
 	RestoreResizeDependentResources(operation);
 	if (!swapChainBufferProxy && !swapChainBufferProxyENB) {
 		return DXGI_ERROR_DEVICE_RESET;
@@ -1266,6 +1269,49 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 #endif
 }
 
+void DX12SwapChain::ConfigureFrameLatency()
+{
+	std::scoped_lock lock(frameLatencyMutex);
+	frameLatencyEvent.close();
+	frameLatencyFrameValid = false;
+	if (!swapChain) { return; }
+	const auto result = swapChain->SetMaximumFrameLatency(1);
+	if (FAILED(result)) {
+		logger::warn("[Presentation] SetMaximumFrameLatency(1) failed hr=0x{:08X}; retaining fence pacing", static_cast<uint32_t>(result));
+		return;
+	}
+	// Use the outer SDK's event, not an unwrapped DXGI event. FSR owns its
+	// replacement handle; duplicate it so our ownership cannot close SDK state.
+	const auto event = swapChain->GetFrameLatencyWaitableObject();
+	HANDLE duplicate = nullptr;
+	if (!event || !DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+		logger::warn("[Presentation] Frame-latency event unavailable; retaining fence pacing");
+		return;
+	}
+	frameLatencyEvent.attach(duplicate);
+	logger::info("[Presentation] DXGI frame latency=1; wait before input via outer swapchain");
+}
+
+void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
+{
+	std::scoped_lock lock(frameLatencyMutex);
+	if (!frameLatencyEvent || (frameLatencyFrameValid && frameLatencyFrame == frame)) { return; }
+	frameLatencyFrame = frame;
+	frameLatencyFrameValid = true;
+	// Bound the wait for minimized/occluded windows and broken SDK events.
+	// Do not pump messages here: that could reenter renderer/resize hooks.
+	DWORD result = WAIT_TIMEOUT;
+	for (unsigned attempt = 0; attempt < 10; ++attempt) {
+		if (IsWindowUnavailable()) { return; }
+		result = WaitForSingleObjectEx(frameLatencyEvent.get(), 10, FALSE);
+		if (result != WAIT_TIMEOUT) { break; }
+	}
+	if (result != WAIT_OBJECT_0) {
+		logger::warn("[Presentation] Frame-latency wait result={}; disabled until swapchain reconfiguration", result);
+		frameLatencyEvent.close();
+	}
+}
+
 void DX12SwapChain::PaceFrameStart(uint32_t frame)
 {
 	if (!IsReady() || deviceLost || IsWindowUnavailable()) {
@@ -1278,6 +1324,7 @@ void DX12SwapChain::PaceFrameStart(uint32_t frame)
 	// Main::OnIdle is the pre-input entry; Renderer::Begin handles standalone
 	// loading/movie draws. The same frame reaching both must only wait once.
 	presentPacing.WaitForFrame(frame, Upscaling::GetSingleton()->settings.outputFPSLimit, multiplier, hwnd);
+	WaitForPresentationCapacity(frame);
 }
 
 void DX12SwapChain::WaitForFrameStart()
@@ -2298,6 +2345,7 @@ bool DX12SwapChain::EnsureFidelityFXFrameGenerationSwapChain()
 			winrt::com_ptr<IDXGISwapChain4> wrappedOwner;
 			wrappedOwner.attach(wrappedSwapChain);
 			swapChain = wrappedOwner;
+			ConfigureFrameLatency();
 			if (swapChainProxy) {
 				swapChainProxy->SetSwapChain(swapChain.get());
 			}
