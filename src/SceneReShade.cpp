@@ -1,13 +1,46 @@
 #include "SceneReShade.h"
-#include "DX12SwapChain.h"
 #include "../extern/ReShade/include/reshade.hpp"
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
+#include <vector>
+#include <winrt/base.h>
+#include <d3d11_3.h>
 #include <d3dcompiler.h>
 
 namespace
 {
+	DXGI_FORMAT SceneStorageFormat(DXGI_FORMAT format)
+	{
+		// Ordinary textures need typeless storage for ReShade's linear/sRGB RTV pair.
+		// Keep float formats typed so ReShade does not infer a UNORM interpretation.
+		switch (format) {
+		case DXGI_FORMAT_R8G8B8A8_UNORM:
+		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+			return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		case DXGI_FORMAT_B8G8R8A8_UNORM:
+		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+			return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+		default:
+			return format;
+		}
+	}
+
+	struct RuntimeDescription
+	{
+		winrt::com_ptr<ID3D11Device> device;
+		HWND window;
+		UINT width, height;
+		DXGI_FORMAT format;
+		bool operator==(const RuntimeDescription& other) const
+		{
+			return device.get() == other.device.get() && window == other.window &&
+				width == other.width && height == other.height && format == other.format;
+		}
+	};
+
 	// A single D3D11 scene buffer, never the real D3D12 presentation buffer.
 	// ReShade's manual runtime only needs IDXGISwapChain, not flip-model interfaces.
 	class SceneSwapChain final : public IDXGISwapChain
@@ -15,6 +48,7 @@ namespace
 	public:
 		winrt::com_ptr<ID3D11Texture2D> color;
 		winrt::com_ptr<ID3D11Device> device;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		HWND window{};
 		std::atomic<ULONG> refs{1};
 		HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override
@@ -38,7 +72,7 @@ namespace
 		{
 			if (!out) return E_POINTER;
 			D3D11_TEXTURE2D_DESC d{}; color->GetDesc(&d); *out = {};
-			out->BufferDesc.Width=d.Width; out->BufferDesc.Height=d.Height; out->BufferDesc.Format=d.Format;
+			out->BufferDesc.Width=d.Width; out->BufferDesc.Height=d.Height; out->BufferDesc.Format=format;
 			out->SampleDesc=d.SampleDesc; out->BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
 			out->BufferCount=1; out->OutputWindow=window; out->Windowed=TRUE; out->SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
 			return S_OK;
@@ -55,12 +89,12 @@ namespace
 	};
 	std::recursive_mutex mutex;
 	bool registered = false;
-	bool failed = false;
+	std::optional<RuntimeDescription> failedRuntime;
 	bool depthValid = false;
+	std::optional<bool> reportedDepthValid;
 	reshade::api::effect_runtime* g_sceneRuntime = nullptr;
 	winrt::com_ptr<SceneSwapChain> scene;
 	winrt::com_ptr<ID3D11ShaderResourceView> currentDepth;
-	reshade::api::resource_view boundDepth{};
 	winrt::com_ptr<ID3D11Texture2D> depthCopy;
 	winrt::com_ptr<ID3D11UnorderedAccessView> depthUAV;
 	winrt::com_ptr<ID3D11ComputeShader> depthShader;
@@ -71,7 +105,9 @@ namespace
 		const std::lock_guard lock(mutex);
 		if (r != g_sceneRuntime) return;
 		const reshade::api::resource_view depth{reinterpret_cast<uint64_t>(currentDepth.get())};
-		if (depth != boundDepth) { r->update_texture_bindings("DEPTH",depth,depth); boundDepth=depth; }
+		// Other providers and effect reloads can change the semantic without changing
+		// our SRV pointer. Publish it each frame on this runtime only.
+		r->update_texture_bindings("DEPTH",depth,depth);
 		r->enumerate_uniform_variables(nullptr,[&](auto* rt, auto u) {
 			char source[32]{};
 			if(rt->get_annotation_string_from_uniform_variable(u,"source",source) && std::strcmp(source,"bufready_depth")==0)
@@ -82,8 +118,6 @@ namespace
 	{ const std::lock_guard lock(mutex); outputs.push_back(r); }
 	void DestroyRuntime(reshade::api::effect_runtime* r)
 	{ const std::lock_guard lock(mutex); std::erase(outputs,r); }
-	void Reload(reshade::api::effect_runtime* r)
-	{ const std::lock_guard lock(mutex); if(r==g_sceneRuntime) boundDepth={}; }
 	bool OpenOverlay(reshade::api::effect_runtime* r, bool open, reshade::api::input_source)
 	{
 		const std::lock_guard lock(mutex);
@@ -100,10 +134,33 @@ namespace
 			r->open_overlay(false, reshade::api::input_source::none);
 		}
 	}
+
+	const char* ValidateDepth(ID3D11ShaderResourceView* depth, ID3D11Device* device, UINT width, UINT height)
+	{
+		if (!depth) return "missing SRV";
+		D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+		depth->GetDesc(&view);
+		if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return "requires a Texture2D SRV";
+		winrt::com_ptr<ID3D11Resource> resource;
+		depth->GetResource(resource.put());
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		if (FAILED(resource->QueryInterface(IID_PPV_ARGS(texture.put())))) return "requires a Texture2D resource";
+		winrt::com_ptr<ID3D11Device> owner;
+		texture->GetDevice(owner.put());
+		if (owner.get() != device) return "depth and color belong to different devices";
+		D3D11_TEXTURE2D_DESC desc{};
+		texture->GetDesc(&desc);
+		if (desc.SampleDesc.Count != 1) return "multisampled depth is unsupported";
+		const UINT mip = view.Texture2D.MostDetailedMip;
+		if (mip >= desc.MipLevels || mip >= 32 || (desc.Width >> mip) < width || (desc.Height >> mip) < height)
+			return "depth view is smaller than the scene rectangle";
+		return nullptr;
+	}
 }
 
 void SceneReShade::Initialize()
 {
+	if (registered) return;
 	HMODULE module{};
 	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 		reinterpret_cast<LPCWSTR>(&Initialize),&module);
@@ -112,7 +169,6 @@ void SceneReShade::Initialize()
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(InitRuntime);
 	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(DestroyRuntime);
 	reshade::register_event<reshade::addon_event::reshade_begin_effects>(BeginEffects);
-	reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(Reload);
 	reshade::register_event<reshade::addon_event::present>(Present);
 	reshade::register_event<reshade::addon_event::reshade_open_overlay>(OpenOverlay);
 }
@@ -121,34 +177,71 @@ void SceneReShade::Reset()
 {
 	const std::lock_guard lock(mutex);
 	if(g_sceneRuntime) { auto* old=g_sceneRuntime; g_sceneRuntime=nullptr; reshade::destroy_effect_runtime(old); }
-	scene=nullptr; currentDepth=nullptr; boundDepth={};
+	scene=nullptr; currentDepth=nullptr;
 	depthCopy=nullptr; depthUAV=nullptr; depthShader=nullptr;
+	failedRuntime.reset(); reportedDepthValid.reset(); depthValid=false;
 }
 
 void SceneReShade::Render(ID3D11Texture2D* color, ID3D11ShaderResourceView* depth, HWND window, UINT width, UINT height)
 {
 	const std::lock_guard lock(mutex);
-	if(!registered || failed || !color || !window || !width || !height) return;
+	if(!registered || !color || !window || !width || !height) return;
 	D3D11_TEXTURE2D_DESC inputDesc{};
 	color->GetDesc(&inputDesc);
 	if(width > inputDesc.Width || height > inputDesc.Height || inputDesc.SampleDesc.Count != 1) return;
 	winrt::com_ptr<ID3D11Device> device;
 	color->GetDevice(device.put());
+	const RuntimeDescription requested{device, window, width, height, inputDesc.Format};
+	if (failedRuntime && *failedRuntime == requested) return;
+	const auto storageFormat = SceneStorageFormat(inputDesc.Format);
 	if(scene) {
 		D3D11_TEXTURE2D_DESC desc{}; scene->color->GetDesc(&desc);
-		if(desc.Width!=width || desc.Height!=height || desc.Format!=inputDesc.Format ||
+		if(desc.Width!=width || desc.Height!=height || desc.Format!=storageFormat || scene->format!=inputDesc.Format ||
 			scene->device.get()!=device.get() || scene->window!=window) Reset();
 	}
 	winrt::com_ptr<ID3D11DeviceContext> context;
 	device->GetImmediateContext(context.put());
 	if(!g_sceneRuntime) {
 		try {
-			scene.attach(new SceneSwapChain()); scene->device=device; scene->window=window;
+			// ReShade 6.8 copies BGRX into a BGRA resolve texture, which is not a
+			// legal D3D11 copy and can remove the device. The game uses RGBA.
+			if (inputDesc.Format==DXGI_FORMAT_B8G8R8X8_UNORM || inputDesc.Format==DXGI_FORMAT_B8G8R8X8_UNORM_SRGB ||
+				inputDesc.Format==DXGI_FORMAT_B8G8R8X8_TYPELESS)
+				throw std::runtime_error("BGRX scene color requires conversion to RGBA/BGRA before ReShade");
+			scene.attach(new SceneSwapChain()); scene->device=device; scene->window=window; scene->format=inputDesc.Format;
 			auto desc=inputDesc;
 			desc.Width=width; desc.Height=height; desc.MipLevels=1; desc.ArraySize=1;
 			desc.Usage=D3D11_USAGE_DEFAULT; desc.CPUAccessFlags=0; desc.MiscFlags=0;
 			desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+			desc.Format=storageFormat;
 			DX::ThrowIfFailed(device->CreateTexture2D(&desc,nullptr,scene->color.put()));
+			// Preflight the exact view formats used by ReShade, retaining HRESULTs
+			// that its bool-returning manual-runtime export would otherwise hide.
+			HRESULT viewResults[2]{};
+			DXGI_FORMAT viewFormats[2]{};
+			winrt::com_ptr<ID3D11Device3> device3;
+			device->QueryInterface(IID_PPV_ARGS(device3.put()));
+			for (int i=0; i<2; ++i) {
+				viewFormats[i]=static_cast<DXGI_FORMAT>(reshade::api::format_to_default_typed(
+					static_cast<reshade::api::format>(storageFormat),i));
+				if (device3) {
+					D3D11_RENDER_TARGET_VIEW_DESC1 view{};
+					view.Format=viewFormats[i]; view.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
+					winrt::com_ptr<ID3D11RenderTargetView1> rtv;
+					viewResults[i]=device3->CreateRenderTargetView1(scene->color.get(),&view,rtv.put());
+				} else {
+					D3D11_RENDER_TARGET_VIEW_DESC view{};
+					view.Format=viewFormats[i]; view.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
+					winrt::com_ptr<ID3D11RenderTargetView> rtv;
+					viewResults[i]=device->CreateRenderTargetView(scene->color.get(),&view,rtv.put());
+				}
+			}
+			logger::info("[Scene ReShade] Backbuffer {}x{} inputFormat={} storageFormat={} linearRTV={} hr=0x{:08X} sRGBRTV={} hr=0x{:08X}",
+				width,height,static_cast<UINT>(inputDesc.Format),static_cast<UINT>(storageFormat),
+				static_cast<UINT>(viewFormats[0]),static_cast<UINT>(viewResults[0]),
+				static_cast<UINT>(viewFormats[1]),static_cast<UINT>(viewResults[1]));
+			DX::ThrowIfFailed(viewResults[0]);
+			DX::ThrowIfFailed(viewResults[1]);
 			desc.Format=DXGI_FORMAT_R32_FLOAT;
 			desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
 			DX::ThrowIfFailed(device->CreateTexture2D(&desc,nullptr,depthCopy.put()));
@@ -168,21 +261,28 @@ void SceneReShade::Render(ID3D11Texture2D* color, ID3D11ShaderResourceView* dept
 			const auto config=directory/"ReShade.ini";
 			if(!reshade::create_effect_runtime(reshade::api::device_api::d3d11,scene->device.get(),context.get(),
 				static_cast<IDXGISwapChain*>(scene.get()),config.string().c_str(),&g_sceneRuntime)) {
-				logger::error("[Scene ReShade] Manual D3D11 runtime creation failed");
-				failed=true; Reset(); return;
+				throw std::runtime_error("Manual D3D11 runtime creation failed; see ReShade.log");
 			}
+			// This provider copies raw, non-reversed engine depth. Configure the
+			// existing ReShade settings through its API so shaders interpret it correctly.
+			g_sceneRuntime->set_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED","0");
+			g_sceneRuntime->set_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN","0");
+			g_sceneRuntime->set_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_LOGARITHMIC","0");
+			failedRuntime.reset();
 			logger::info("[Scene ReShade] Created D3D11 scene runtime before SR: {}x{}; config=ReShade.ini",width,height);
 		} catch(const std::exception& e) {
-			logger::error("[Scene ReShade] Initialization failed: {}",e.what());
-			failed=true; Reset(); return;
+			logger::error("[Scene ReShade] Initialization failed: {}; retry after reset or scene/device change",e.what());
+			Reset(); failedRuntime=requested; return;
 		}
 	}
-	if (depth) {
-		D3D11_SHADER_RESOURCE_VIEW_DESC view{};
-		depth->GetDesc(&view);
-		if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) depth = nullptr;
+	const char* depthError=ValidateDepth(depth,device.get(),width,height);
+	depthValid=depthError==nullptr;
+	if (!reportedDepthValid || *reportedDepthValid!=depthValid) {
+		if (depthValid) logger::info("[Scene ReShade] DEPTH ready: {}x{}, R32_FLOAT, non-reversed",width,height);
+		else logger::warn("[Scene ReShade] DEPTH unavailable: {}",depthError);
+		reportedDepthValid=depthValid;
 	}
-	depthValid = depth != nullptr;
+	if (!depthValid) depth=nullptr;
 	const D3D11_BOX box{0,0,0,width,height,1};
 	context->CopySubresourceRegion(scene->color.get(),0,0,0,0,color,0,&box);
 	if(depth) {
