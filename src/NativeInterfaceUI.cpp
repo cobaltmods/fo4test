@@ -132,6 +132,7 @@ void Release()
 namespace
 {
 	bool enabled = false;
+	bool pipboyAllocationReady = false;
 	thread_local bool rendering = false;
 	thread_local bool nativeScreenPass = false;
 	thread_local int colorTarget = 0;
@@ -140,6 +141,22 @@ namespace
 	thread_local uint32_t modelFrame = UINT32_MAX;
 	thread_local std::array<RE::Interface3D::Renderer*, 64> renderedModels{};
 	thread_local size_t renderedModelCount = 0;
+
+	bool UsesNativeModelTargets(const RE::Interface3D::Renderer* renderer)
+	{
+		return renderer && renderer->postAA && renderer->screenAttachedElementRoot &&
+			renderer->omsize.get() == RE::Interface3D::OffscreenMenuSize::kFullFrame;
+	}
+
+	void BeginNativeModelTargets(RE::Interface3D::Renderer* renderer);
+	void EndNativeModelTargets(RE::Interface3D::Renderer* renderer = nullptr);
+	bool HasReducedENBScene()
+	{
+		const auto& domain = ENBRenderDomain::Get();
+		const auto* swap = DX12SwapChain::GetSingleton();
+		return domain.Active() && (domain.Width() != swap->swapChainDesc.Width ||
+			domain.Height() != swap->swapChainDesc.Height);
+	}
 
 	bool AlreadyRendered(RE::Interface3D::Renderer* a_renderer)
 	{
@@ -178,6 +195,7 @@ namespace
 						}
 					}
 				}
+				BeginNativeModelTargets(a_renderer);
 				func(a_renderer);
 			}
 		}
@@ -191,6 +209,7 @@ namespace
 			if (!AlreadyRendered(a_renderer)) {
 				func(a_renderer, a_target);
 			}
+			EndNativeModelTargets(a_renderer);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
@@ -236,11 +255,11 @@ namespace
 			}
 		}
 
-		void Bind(RE::BSGraphics::RenderTargetManager* a_manager)
+		void Bind(RE::BSGraphics::RenderTargetManager* a_manager, uint32_t a_logical = 1)
 		{
 			const auto offset = REX::FModule::IsRuntimeOG() ? 0xF54u : 0xF84u;
 			const auto* ids = reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(a_manager) + offset);
-			const auto index = ids[1];
+			const auto index = ids[a_logical];
 			auto* data = RE::BSGraphics::GetRendererData();
 			if (index >= std::size(data->depthStencilTargets)) {
 				return;
@@ -293,7 +312,7 @@ namespace
 				cloneSRV(engine.srViewStencil, next.target.srViewStencil, 1);
 				next.generation = swap->NativeUIGeneration();
 				*this = std::move(next);
-				logger::info("[ENB UI] Native Interface3D depth/stencil {}x{}", desc.Width, desc.Height);
+				logger::info("[ENB UI] Native Interface3D depth{} {}x{}", a_logical, desc.Width, desc.Height);
 			}
 			const auto frame = Util::State_GetSingleton()->frameCount;
 			if (clearedFrame != frame) {
@@ -315,6 +334,217 @@ namespace
 			DirtyDepthBinding();
 		}
 	} nativeDepth;
+	NativeDepth nativeMaskDepth;
+
+	struct NativeModelColor
+	{
+		winrt::com_ptr<ID3D11Texture2D> texture, copyTexture;
+		winrt::com_ptr<ID3D11RenderTargetView> rtv;
+		winrt::com_ptr<ID3D11ShaderResourceView> srv, copySRV;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+		RE::BSGraphics::RenderTarget target{}, original{};
+		D3D11_TEXTURE2D_DESC description{};
+		RE::BSGraphics::RenderTargetProperties properties{};
+		uint32_t slot = UINT32_MAX;
+		bool acquired = false;
+
+		void Prepare(const RE::BSGraphics::RenderTarget& a_source, uint32_t a_width, uint32_t a_height)
+		{
+			D3D11_TEXTURE2D_DESC desc{};
+			reinterpret_cast<ID3D11Texture2D*>(a_source.texture)->GetDesc(&desc);
+			desc.Width = a_width;
+			desc.Height = a_height;
+			desc.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+			if (texture && std::memcmp(&desc, &description, sizeof(desc)) == 0 &&
+				static_cast<bool>(copyTexture) == (a_source.copyTexture != nullptr)) {
+				return;
+			}
+			NativeModelColor next;
+			auto* device = reinterpret_cast<ID3D11Device*>(RE::BSGraphics::GetRendererData()->device);
+			DX::ThrowIfFailed(device->CreateTexture2D(&desc, nullptr, next.texture.put()));
+			if (a_source.rtView) {
+				D3D11_RENDER_TARGET_VIEW_DESC view{};
+				reinterpret_cast<ID3D11RenderTargetView*>(a_source.rtView)->GetDesc(&view);
+				DX::ThrowIfFailed(device->CreateRenderTargetView(next.texture.get(), &view, next.rtv.put()));
+			}
+			if (a_source.srView) {
+				D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+				reinterpret_cast<ID3D11ShaderResourceView*>(a_source.srView)->GetDesc(&view);
+				DX::ThrowIfFailed(device->CreateShaderResourceView(next.texture.get(), &view, next.srv.put()));
+			}
+			if (a_source.uaView) {
+				D3D11_UNORDERED_ACCESS_VIEW_DESC view{};
+				reinterpret_cast<ID3D11UnorderedAccessView*>(a_source.uaView)->GetDesc(&view);
+				DX::ThrowIfFailed(device->CreateUnorderedAccessView(next.texture.get(), &view, next.uav.put()));
+			}
+			if (a_source.copyTexture) {
+				D3D11_TEXTURE2D_DESC copyDesc{};
+				reinterpret_cast<ID3D11Texture2D*>(a_source.copyTexture)->GetDesc(&copyDesc);
+				copyDesc.Width = a_width;
+				copyDesc.Height = a_height;
+				DX::ThrowIfFailed(device->CreateTexture2D(&copyDesc, nullptr, next.copyTexture.put()));
+				if (a_source.copySRView) {
+					D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+					reinterpret_cast<ID3D11ShaderResourceView*>(a_source.copySRView)->GetDesc(&view);
+					DX::ThrowIfFailed(device->CreateShaderResourceView(next.copyTexture.get(), &view, next.copySRV.put()));
+				}
+			}
+			next.target.texture = reinterpret_cast<REX::W32::ID3D11Texture2D*>(next.texture.get());
+			next.target.copyTexture = reinterpret_cast<REX::W32::ID3D11Texture2D*>(next.copyTexture.get());
+			next.target.rtView = reinterpret_cast<REX::W32::ID3D11RenderTargetView*>(next.rtv.get());
+			next.target.srView = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(next.srv.get());
+			next.target.copySRView = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(next.copySRV.get());
+			next.target.uaView = reinterpret_cast<REX::W32::ID3D11UnorderedAccessView*>(next.uav.get());
+			next.description = desc;
+			// Preserve this pass's engine acquisition while replacing the cache.
+			next.acquired = acquired;
+			*this = std::move(next);
+		}
+	};
+
+	// Logical IDs, not RendererData's allocation-order indices. These are the
+	// deferred buffers and outputs selected from each renderer's configuration.
+	// Never resize their world allocations or ENB's private resources globally.
+	std::array<NativeModelColor, 100> modelColors;
+	thread_local bool modelTargetsActive = false;
+	thread_local RE::Interface3D::Renderer* modelTargetOwner = nullptr;
+	thread_local bool maskDepthAcquired = false;
+	using TargetLifetime = void (*)(RE::BSGraphics::RenderTargetManager*, int);
+
+	void EndNativeModelTargets(RE::Interface3D::Renderer* a_renderer)
+	{
+		if (!modelTargetsActive || (a_renderer && a_renderer != modelTargetOwner)) { return; }
+		nativeDepth.Restore();
+		nativeMaskDepth.Restore();
+		auto* manager = Util::RenderTargetManager_GetSingleton();
+		auto* data = RE::BSGraphics::GetRendererData();
+		if (maskDepthAcquired) {
+			static REL::Relocation<TargetLifetime> releaseMaskDepth{ REL::ID{ 922599, 2277222 } };
+			releaseMaskDepth(manager, 4);
+			maskDepthAcquired = false;
+		}
+		static REL::Relocation<TargetLifetime> releaseModelTarget{ REL::ID{ 1374956, 2277220 } };
+		for (size_t i = 0; i < modelColors.size(); ++i) {
+			auto& color = modelColors[i];
+			if (color.slot != UINT32_MAX) {
+				data->renderTargets[color.slot] = color.original;
+				manager->renderTargetData[static_cast<int>(i)] = color.properties;
+				color.slot = UINT32_MAX;
+			}
+			if (color.acquired) {
+				// Release only AFTER restoring engine ownership. The extra acquire
+				// pins pooled RT37/52 across the prepass's own Acquire/Release pair
+				// and keeps their native output available to RenderMain.
+				releaseModelTarget(manager, static_cast<int>(i));
+				color.acquired = false;
+			}
+		}
+		modelTargetsActive = false;
+		modelTargetOwner = nullptr;
+		DirtyDepthBinding();
+	}
+
+	void BeginNativeModelTargets(RE::Interface3D::Renderer* a_renderer)
+	{
+		if (!nativeScreenPass || !HasReducedENBScene() ||
+			modelTargetsActive || !UsesNativeModelTargets(a_renderer)) { return; }
+		// Keep Workbench's entire model/ModMenu intermediate chain on the
+		// existing engine allocations. ENB requires scene-sized deferred output.
+		// RT62/63 and final UI composition retain their existing allocation policy.
+		if (a_renderer->name == "WorkbenchItem3D") { return; }
+		auto* swap = DX12SwapChain::GetSingleton();
+		if (!swap->IsNativeUIActive()) { return; }
+		auto* manager = Util::RenderTargetManager_GetSingleton();
+		auto* data = RE::BSGraphics::GetRendererData();
+		const auto offset = REX::FModule::IsRuntimeOG() ? 0xDC4u : 0xDF4u;
+		const auto* ids = reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(manager) + offset);
+		static REL::Relocation<TargetLifetime> acquireModelTarget{ REL::ID{ 1468639, 2277219 } };
+		static REL::Relocation<TargetLifetime> releaseModelTarget{ REL::ID{ 1374956, 2277220 } };
+		modelTargetsActive = true;
+		modelTargetOwner = a_renderer;
+		try {
+			const auto fx = a_renderer->postfx.get();
+			const bool offscreenModel = a_renderer->offscreen3DEnabled && (a_renderer->offscreenElement ||
+				(a_renderer->highlightedElement && a_renderer->highlightOffscreen));
+			const bool deferred = a_renderer->defRenderMainScreen ||
+				(offscreenModel && (fx == RE::Interface3D::PostEffect::kHUDGlassWithMod ||
+				fx == RE::Interface3D::PostEffect::kModMenu ||
+				fx == RE::Interface3D::PostEffect::kModMenuHighlightAll ||
+				fx == RE::Interface3D::PostEffect::kModMenuHighlightAllNoPulseOrScanLines));
+			std::array<bool, 100> selected{};
+			auto select = [&](int target) {
+				// RT0 is the final UI destination; fixed-size Pipboy/text surfaces
+				// have a separate allocation policy. Never borrow their slots here.
+				if (target > 0 && target < 100 && target != 60 && target != 61 && target != 64) {
+					selected[target] = true;
+				}
+			};
+			if (deferred) {
+				for (int target : {26, 27, 29, 30, 31, 32, 33, 34}) { select(target); }
+			}
+			// ModMenu consumes Albedo26/Mask15/Normals27/Image37 together.
+			// Its RenderMask producer writes RT15 with depth4, independently of
+			// the model's G-buffer/depth1. Keep both producer targets native.
+			const bool modMenu = fx == RE::Interface3D::PostEffect::kModMenu ||
+				fx == RE::Interface3D::PostEffect::kModMenuHighlightAll ||
+				fx == RE::Interface3D::PostEffect::kModMenuHighlightAllNoPulseOrScanLines;
+			if (modMenu) {
+				select(15);
+				static REL::Relocation<TargetLifetime> acquireMaskDepth{ REL::ID{ 1015879, 2277221 } };
+				acquireMaskDepth(manager, 4);
+				maskDepthAcquired = true;
+				nativeMaskDepth.Bind(manager, 4);
+			}
+			if (offscreenModel) { select(52); }
+			if (offscreenModel && (fx == RE::Interface3D::PostEffect::kHUDGlassWithMod ||
+				fx == RE::Interface3D::PostEffect::kModMenu)) { select(37); }
+			select(a_renderer->customRenderTarget >= 0 ? a_renderer->customRenderTarget : 63);
+			select(a_renderer->customSwapTarget >= 0 ? a_renderer->customSwapTarget : 63);
+			bool allocated = false;
+			// Allocate the entire set before publishing any replacement. Optional
+			// G-buffer outputs are absent when the engine disables their feature.
+			for (size_t i = 0; i < modelColors.size(); ++i) {
+				const auto logical = static_cast<int>(i);
+				if (!selected[i]) { continue; }
+				if (!manager->renderTargetData[logical].width || !manager->renderTargetData[logical].height) { continue; }
+				acquireModelTarget(manager, logical);
+				auto& color = modelColors[i];
+				color.acquired = true;
+				if (ids[logical] >= std::size(data->renderTargets) || !data->renderTargets[ids[logical]].texture) {
+					throw std::runtime_error("Interface3D render target is unavailable");
+				}
+				const auto& source = data->renderTargets[ids[logical]];
+				D3D11_TEXTURE2D_DESC desc{};
+				reinterpret_cast<ID3D11Texture2D*>(source.texture)->GetDesc(&desc);
+				if (desc.Width == swap->swapChainDesc.Width && desc.Height == swap->swapChainDesc.Height) {
+					releaseModelTarget(manager, logical);
+					color.acquired = false;
+					continue;
+				}
+				allocated |= !color.texture || color.description.Width != swap->swapChainDesc.Width || color.description.Height != swap->swapChainDesc.Height;
+				color.Prepare(source, swap->swapChainDesc.Width, swap->swapChainDesc.Height);
+			}
+			for (size_t i = 0; i < modelColors.size(); ++i) {
+				auto& color = modelColors[i];
+				if (!color.acquired) { continue; }
+				const auto logical = static_cast<int>(i);
+				color.slot = ids[logical];
+				color.original = data->renderTargets[color.slot];
+				color.properties = manager->renderTargetData[logical];
+				data->renderTargets[color.slot] = color.target;
+				manager->renderTargetData[logical].width = swap->swapChainDesc.Width;
+				manager->renderTargetData[logical].height = swap->swapChainDesc.Height;
+			}
+			if (nativeDepth.slot < 0) { nativeDepth.Bind(manager); }
+			DirtyDepthBinding();
+			if (allocated) {
+				logger::info("[ENB UI] Native model targets for {}: {}x{}", a_renderer->name.c_str(), swap->swapChainDesc.Width, swap->swapChainDesc.Height);
+			}
+		} catch (const std::exception& e) {
+			EndNativeModelTargets();
+			logger::error("[ENB UI] Native model targets unavailable: {}", e.what());
+		}
+	}
 
 	// RT62/63 are native-sized even during pre-AA/model work. Their DSV must
 	// follow each color binding, not just the post-AA RenderAll invocation.
@@ -326,7 +556,9 @@ namespace
 		}
 		~RenderScope()
 		{
+			EndNativeModelTargets();
 			nativeDepth.Restore();
+			nativeMaskDepth.Restore();
 			rendering = false;
 		}
 	};
@@ -355,6 +587,39 @@ namespace
 		}
 	}
 
+	bool PromotePipboyExtent(uint32_t& width, uint32_t& height)
+	{
+		const auto displayHeight = DX12SwapChain::GetSingleton()->swapChainDesc.Height;
+		if (!enabled || !pipboyAllocationReady || !ENBRenderDomain::Get().Active() ||
+			!width || !height || height >= displayHeight) { return false; }
+		// Keep the INI aspect and logical menu coordinates. Only the physical
+		// color/depth allocation grows; never reduce a user's higher INI setting.
+		const auto scaledWidth = (uint64_t{ width } * displayHeight + height - 1) / height;
+		if (scaledWidth > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+			displayHeight > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) { return false; }
+		width = static_cast<uint32_t>(scaledWidth);
+		height = displayHeight;
+		return true;
+	}
+
+	struct CreateDepthTarget
+	{
+		static void thunk(RE::BSGraphics::RenderTargetManager* manager, int target,
+			const void* properties, int persistency)
+		{
+			if (target != 3) { func(manager, target, properties, persistency); return; }
+			// AE adds a field at +0x18. Preserve its full descriptor instead of
+			// copying CommonLib's OG-sized DepthStencilTargetProperties.
+			std::array<uint32_t, 7> copy{};
+			std::memcpy(copy.data(), properties, REX::FModule::IsRuntimeOG() ? 0x18 : 0x1C);
+			if (PromotePipboyExtent(copy[0], copy[1])) {
+				logger::info("[ENB UI] Pipboy depth3 {}x{}", copy[0], copy[1]);
+			}
+			func(manager, target, copy.data(), persistency);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
 	struct CreateTarget
 	{
 		static void thunk(RE::BSGraphics::RenderTargetManager* a_manager, int a_target,
@@ -362,13 +627,17 @@ namespace
 		{
 			auto properties = a_properties;
 			const auto* swap = DX12SwapChain::GetSingleton();
-			// HUDGlass's input and mask output. Keep fixed-size Pipboy/text targets
-			// and all world/ENB targets unchanged. Resize follows normal engine ownership.
+			// HUDGlass's input and mask output. Resize follows engine ownership.
 			if (enabled && ENBRenderDomain::Get().Active() && (a_target == 62 || a_target == 63) &&
 				properties.mipLevel < 0 && swap->swapChainDesc.Width && swap->swapChainDesc.Height) {
 				properties.width = swap->swapChainDesc.Width;
 				properties.height = swap->swapChainDesc.Height;
 				logger::info("[ENB UI] Native custom RT{} {}x{} -> {}x{}", a_target,
+					a_properties.width, a_properties.height, properties.width, properties.height);
+			}
+			if ((a_target == 60 || a_target == 61) && properties.mipLevel < 0 &&
+				PromotePipboyExtent(properties.width, properties.height)) {
+				logger::info("[ENB UI] Pipboy RT{} {}x{} -> {}x{}", a_target,
 					a_properties.width, a_properties.height, properties.width, properties.height);
 			}
 			func(a_manager, a_target, properties, a_persistency);
@@ -521,6 +790,7 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 			break;
 		}
 		if (!renderer || !renderer->enabled || !renderer->postAA || AlreadyRendered(renderer) ||
+			(HasReducedENBScene() && UsesNativeModelTargets(renderer)) ||
 			!renderer->screenAttachedElementRoot ||
 			renderer->omsize.get() != RE::Interface3D::OffscreenMenuSize::kFullFrame) {
 			continue;
@@ -549,11 +819,15 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 
 void NativeInterfaceUI::ReleaseResources()
 {
+	EndNativeModelTargets();
+	modelColors = {};
 	WorldGuides::Release();
 	// Called by the interop resize transaction, after outstanding GPU work drains.
 	// Do not retain a former device's depth allocation across a resize/recreation.
 	nativeDepth.Restore();
 	nativeDepth = {};
+	nativeMaskDepth.Restore();
+	nativeMaskDepth = {};
 	modelFrame = UINT32_MAX;
 	renderedModelCount = 0;
 }
@@ -566,6 +840,9 @@ void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 		const auto create = stl::detour_thunk_gateway<CreateTarget>(REL::ID{ 43433, 2277176 }, isOG ? 5 : 6, "Interface3D native target allocation");
 		const auto color = stl::detour_thunk_gateway<SetColor>(REL::ID{ 1502425, 2277188 }, isOG ? 6 : 5, "Interface3D color target tracking");
 		const auto depth = InstallDepthHook();
+		const auto pipboyDepth = stl::detour_thunk_gateway<CreateDepthTarget>(REL::ID{ 1159619, 2277177 },
+			isOG ? 5 : 6, "Interface3D Pipboy depth allocation");
+		pipboyAllocationReady = create && pipboyDepth;
 		nativeHooksReady = create && color && depth;
 	}
 	// Hook the worker, not RenderPostAA's MOV DL,1 / relative tail jump.

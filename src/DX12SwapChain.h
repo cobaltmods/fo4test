@@ -120,6 +120,7 @@ public:
 	// A same-frame, display-sized image for the engine's synchronous screenshot encoder.
 	std::shared_ptr<D3D11D3D12SharedTexture> CaptureScreenshot();
 	uint64_t NativeUIGeneration() const { return nativeUIGeneration; }
+	bool IsNativeUIActive() const { return nativeUIActive; }
 	uint64_t ENBSceneResizeGeneration() const { return enbSceneResizeGeneration; }
 	HRESULT ResizeBuffers(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags);
 	HRESULT ResizeBuffers1(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask, IUnknown* const* a_presentQueue);
