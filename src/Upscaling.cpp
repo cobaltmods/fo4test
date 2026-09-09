@@ -1616,10 +1616,14 @@ void Upscaling::InstallHooks()
 		"Interface3D::Renderer::Create");
 
 	const auto isOG = REX::FModule::IsRuntimeOG();
+	const auto isNG = REX::FModule::IsRuntimeNG();
 	// Normal simulation pacing before input/jobs, then the scene handoff.
 	// The existing CALL5 helper retains each previous callee in func.
+	// NG 1.10.984: Main::Run was inlined into the startup routine (id 2718225);
+	// the standalone copy (id 2228908) is never called, and the live
+	// `call Main::OnIdle` sits at +0xEB instead of AE's +0xCB.
 	stl::write_thunk_call<Main_Run_OnIdle>(
-		REL::ID{ 1125396, 4484191 }.address() + (isOG ? 0xBB : 0xCB));
+		REL::ID{ 1125396, 2718225, 4484191 }.address() + (isOG ? 0xBB : isNG ? 0xEB : 0xCB));
 	stl::write_thunk_call<Main_OnIdle_Swap>(
 		REL::ID{ 633524, 2228917 }.address() + (isOG ? 0x6EC : 0xCDC));
 	logger::info("[Reflex] Installed Main simulation hooks; previous OnIdle={:x}, Swap={:x}",

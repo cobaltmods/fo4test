@@ -758,8 +758,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDLSS) {
 		return;
 	}
-	static REL::Relocation<const bool*> disabled{ REL::ID{ 789743, 4803742 } };
-	static REL::Relocation<const bool*> preAAEnabled{ REL::ID{ 339016, 4803740 } };
+	static REL::Relocation<const bool*> disabled{ REL::ID{ 789743, 2696451, 4803742 } };
+	static REL::Relocation<const bool*> preAAEnabled{ REL::ID{ 339016, 2696449, 4803740 } };
 	if (*disabled || !*preAAEnabled) {
 		return;
 	}
@@ -768,8 +768,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		modelFrame = frame;
 		renderedModelCount = 0;
 	}
-	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 4803746 } };
-	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 4803745 } };
+	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 2696455, 4803746 } };
+	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 2696454, 4803745 } };
 	static REL::Relocation<bool*> shaderPostAA{ REL::ID{ 801215, 2712496 } };
 	static REL::Relocation<uint32_t*> displayTarget{ REL::ID{ 113725, 2712501 } };
 	using HasMenus = bool (*)(RE::UI*, const RE::BSFixedString&);
