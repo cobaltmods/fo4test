@@ -69,9 +69,12 @@ inline constexpr char NVSDK_NGX_Parameter_DLSSNR_UICorrection[] = "DLSSNR.UICorr
 
 namespace nvngx::dlss_nr
 {
+	// Host convention is NGX PerfQualityValue + 1: DLAA / Native = 5 + 1.
+	inline constexpr std::uint32_t kNativePerformanceMode = 6;
+
 	struct Options
 	{
-		std::uint32_t performanceMode = 3;
+		std::uint32_t performanceMode = kNativePerformanceMode;
 		std::uint32_t preset = 0;
 		std::uint32_t style = 0;
 		float intensity = 1.0f;

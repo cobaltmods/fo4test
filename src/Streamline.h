@@ -135,7 +135,7 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
+	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
 
 	/**
 	 * @brief Update Streamline constants for current frame
@@ -209,7 +209,7 @@ public:
 	 * Called when switching to a different upscaling method.
 	 */
 	void DisableDLSS();
-	void DestroyDLSSResources();
+	void DestroyDLSSResources(bool a_preserveDirectNR = false);
 	void SuspendDLSSNR();
 	void ResumeDLSSNR();
 
@@ -291,7 +291,7 @@ private:
 	bool ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a_outputColor, ID3D11DeviceContext* a_context, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset);
-	bool EnsureD3D12DLSSNROptions(sl::DLSSMode a_mode, const sl::DLSSNROptions& a_options);
+	bool EnsureD3D12DLSSNROptions(const sl::DLSSNROptions& a_options);
 	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
 	bool ValidateConstantsForFrame(sl::FrameToken* a_frameToken);

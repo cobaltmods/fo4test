@@ -432,8 +432,11 @@ namespace
 		changed |= CheckboxSetting(
 			"DLSS Neural Rendering",
 			settings.dlssNREnabled,
-			"Runs experimental DLSS-NR before DLSS SR. If NR fails, SR uses the original color input.");
+			"Runs experimental DLSS-NR at the selected stage. NR failure preserves the SR path.");
 		ImGuiMCP::BeginDisabled(settings.dlssNREnabled == 0);
+		static constexpr std::array nrPositions{ "Before SR", "After SR" };
+		changed |= ComboSetting("NR Position", settings.dlssNRPosition, nrPositions,
+			"Before SR processes render resolution. After SR processes display resolution before UI composition and costs more GPU time and memory.");
 		changed |= SliderIntSetting(
 			"NR Passes",
 			settings.dlssNRPassCount,

@@ -89,11 +89,11 @@ public:
 		uint dynamicMFGTargetFPS = 300;                              ///< Dynamic MFG target FPS; 0 lets Streamline auto-detect display refresh
 		uint reflexMode = 1;                                        ///< Reflex mode: 0=Off, 1=On, 2=On + Boost
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
-		uint dlssNREnabled = 1;                                     ///< Prefer DLSS-NR uplift over DLSS SR when available
+		uint dlssNRPosition = 0;                                    ///< 0: Before SR, 1: After SR
+		uint dlssNREnabled = 1;                                     ///< Enable optional NR at the selected SR stage
 		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
 		uint vsyncMode = 0;                                        ///< 0=game, 1=off, 2=on
 		uint outputFPSLimit = 0;                                   ///< FG-inclusive target, 0=unlimited, otherwise 10..500
-		uint dlssNRPerformanceMode = 0;                             ///< 0=Follow quality mode, 1..4=NGX modes, 5=DLAA
 		uint dlssNRPreset = 0;                                      ///< DLSS-NR preset: 0=Default, 1..3=preview presets
 		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic
 		uint dlssNRUseAutoMask = 0;                                 ///< Ask DLSS-NR to generate its control mask
@@ -407,7 +407,14 @@ public:
 	/**
 	 * @brief Destroy upscaling-specific resources
 	 */
-	void DestroyUpscalingResources();
+	void DestroyUpscalingResources(bool a_preserveNativeNR = false, bool a_interopIdle = false);
+	bool IsDLSSNRReady() const { return settings.dlssNREnabled != 0 && !nrAwaitingPresent; }
+	void DeferNRUntilPresent(bool a_settingsChanged = true);
+	void OnNRPresentComplete(uint32_t a_slot);
+	bool nrAwaitingPresent = true;
+	uint64_t nrSettingsGeneration = 1;
+	std::array<uint64_t, kDX12FrameCount> nrCapturedGeneration{};
+	std::array<uint64_t, kDX12FrameCount> nrEvaluatedGeneration{};
 
 	std::unique_ptr<Texture2D> upscalingTexture;           ///< Intermediate upscaling texture
 	std::unique_ptr<Texture2D> spatialFallbackTexture;     ///< Full-resolution local fallback output
@@ -424,10 +431,13 @@ public:
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssDepthSharedTextures;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssMotionVectorD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssDepthD3D12;
-	// NR consumes pixel displacement including the sample-position jitter delta.
+	// NR consumes pixel displacement; only Before SR includes sample jitter.
 	// SR/FG continue to use their original, separate guide resources.
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> nrMotionSharedTextures;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> nrMotionD3D12;
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> nrDepthSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> nrDepthD3D12;
+	std::array<bool, kDX12FrameCount> nrAfterSR{};
 	std::array<bool, kDX12FrameCount> nrMotionReady{};
 	std::array<float2, kDX12FrameCount> nrMotionJitterDeltas{};
 	winrt::com_ptr<ID3D11ComputeShader> nrMotionCS;
@@ -435,7 +445,10 @@ public:
 	bool nrMotionHistoryValid = false;
 	uint32_t nrMotionPreviousFrame = 0;
 	float2 nrMotionPreviousJitter{}, nrMotionPreviousSize{}, nrMotionCurrentDelta{};
+	winrt::com_ptr<ID3D11ComputeShader> nrAfterMotionCS;
+	winrt::com_ptr<ID3D11Buffer> nrAfterMotionConstants;
 	bool CaptureNRMotion(UINT slot, UINT width, UINT height);
+	bool CaptureNRAfterSRGuides(UINT slot, UINT width, UINT height, float2 displaySize);
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssTransparencyMaskSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrInputSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrOutputSharedTextures;

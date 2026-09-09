@@ -95,27 +95,6 @@ namespace
 		}
 	}
 
-	uint32_t DLSSNRPerformanceMode(sl::DLSSMode a_mode)
-	{
-		// The private runtime accepts the NGX performance-quality values plus one
-		// so zero can remain invalid: Performance=1, Balanced=2, Quality=3,
-		// Ultra Performance=4 and DLAA=6.
-		switch (a_mode) {
-		case sl::DLSSMode::eMaxPerformance:
-			return 1;
-		case sl::DLSSMode::eBalanced:
-			return 2;
-		case sl::DLSSMode::eUltraPerformance:
-			return 4;
-		case sl::DLSSMode::eDLAA:
-			return 6;
-		case sl::DLSSMode::eMaxQuality:
-		case sl::DLSSMode::eUltraQuality:
-		default:
-			return 3;
-		}
-	}
-
 	bool SameDLSSNROptions(const sl::DLSSNROptions& a_lhs, const sl::DLSSNROptions& a_rhs)
 	{
 		return a_lhs.mode == a_rhs.mode &&
@@ -1238,13 +1217,11 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	return true;
 }
 
-bool Streamline::EnsureD3D12DLSSNROptions(sl::DLSSMode a_mode, const sl::DLSSNROptions& a_options)
+bool Streamline::EnsureD3D12DLSSNROptions(const sl::DLSSNROptions& a_options)
 {
 	auto options = a_options;
 	options.mode = sl::DLSSNRMode::eOn;
-	if (options.performanceMode == 0) {
-		options.performanceMode = DLSSNRPerformanceMode(a_mode);
-	}
+	options.performanceMode = nvngx::dlss_nr::kNativePerformanceMode;
 	if (currentD3D12DLSSNROptionsValid && SameDLSSNROptions(currentD3D12DLSSNROptions, options)) {
 		return true;
 	}
@@ -1358,7 +1335,7 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
-bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
+bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
 {
 	if (a_sharpened) {
 		*a_sharpened = false;
@@ -1458,7 +1435,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		}
 
 		if (a_useDLSSNR) {
-			if (!EnsureD3D12DLSSNROptions(dlssMode, a_dlssNROptions)) {
+			if (!EnsureD3D12DLSSNROptions(a_dlssNROptions)) {
 				return false;
 			}
 		} else {
@@ -1535,11 +1512,14 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		return true;
 	};
 
+	const auto& nrExtent = a_nrAfterSR ? fullExtent : lowResExtent;
 	const auto evaluateDLSSNR = [&]() {
 		// Prefer NVIDIA's Streamline plugin when it survived discovery. When
 		// discovery rejected the private runtime, use the feature DLL directly;
 		// do not retry a failed evaluation through the other NR backend.
-		if (featureDLSSNR && slDLSSNRSetOptions) {
+		// After SR uses direct NGX so NR can consume resolved guides without
+		// changing SR/FG's immutable Streamline common constants or tags.
+		if (!a_nrAfterSR && featureDLSSNR && slDLSSNRSetOptions) {
 			if (a_dlssNRPassCount > 1 && !loggedNativeDLSSNRMultipass) {
 				logger::info("[Streamline] DLSS-NR multipass is only available on the direct-NGX path; using one Streamline NR pass");
 				loggedNativeDLSSNRMultipass = true;
@@ -1552,19 +1532,20 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 
 		nvngx::dlss_nr::D3D12EvaluationParameters parameters{};
 		// Never silently feed raw UV motion to NR if conversion failed.
-		if (!a_nrMotionVectors) { return false; }
-		parameters.color = a_color;
-		parameters.output = a_outputColor;
+		if (!covers(a_nrMotionVectors, a_nrAfterSR ? a_displaySize : a_renderSize, false) ||
+			(a_nrAfterSR && !covers(a_nrDepth, a_displaySize, false))) { return false; }
+		parameters.color = a_nrAfterSR ? a_outputColor : a_color;
+		parameters.output = a_nrAfterSR ? a_sharpenedOutput : a_outputColor;
 		parameters.motionVectors = a_nrMotionVectors;
-		parameters.depth = a_depth;
-		parameters.inputWidth = lowResExtent.width;
-		parameters.inputHeight = lowResExtent.height;
-		parameters.outputWidth = lowResExtent.width;
-		parameters.outputHeight = lowResExtent.height;
-		parameters.guideWidth = lowResExtent.width;
-		parameters.guideHeight = lowResExtent.height;
+		parameters.depth = a_nrAfterSR ? a_nrDepth : a_depth;
+		parameters.inputWidth = nrExtent.width;
+		parameters.inputHeight = nrExtent.height;
+		parameters.outputWidth = nrExtent.width;
+		parameters.outputHeight = nrExtent.height;
+		parameters.guideWidth = nrExtent.width;
+		parameters.guideHeight = nrExtent.height;
 		// The NR-only texture already contains pixel displacement and the
-		// previous-current sample jitter delta. Do not scale it a second time.
+		// sample jitter delta before SR only. Do not scale it a second time.
 		parameters.motionVectorScaleX = 1.0f;
 		parameters.motionVectorScaleY = 1.0f;
 		parameters.depthInverted = false;
@@ -1574,8 +1555,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			return false;
 		}
 		parameters.reset = lastTemporalResetFrameIndex == constantsFrameIndex;
-		parameters.options.performanceMode = a_dlssNROptions.performanceMode == 0 ?
-			DLSSNRPerformanceMode(dlssMode) : a_dlssNROptions.performanceMode;
+		parameters.options.performanceMode = nvngx::dlss_nr::kNativePerformanceMode;
 		parameters.options.preset = a_dlssNROptions.preset;
 		parameters.options.style = a_dlssNROptions.style;
 		parameters.options.intensity = a_dlssNROptions.intensity;
@@ -1587,13 +1567,14 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	};
 
 	const bool dlssNRRequested = !dlssNRSuspended && a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
+
 #ifdef UPSCALING_NR_CAPTURE
 	const bool capture = NRDiagnosticCapture::Requested() && dlssNRRequested && a_sharpenedOutput &&
 		ValidateConstantsForFrame(a_frameToken) && NRDiagnosticCapture::Begin(a_commandList, constantsFrameIndex,
 			std::format("\"engine_frame\":{},\"token\":{},\"render\":[{},{}],\"display\":[{},{}],\"jitter\":[{},{}],\"common_reset\":{},\"direct_ngx\":{},\"requested_passes\":{},\"quality\":{},\"style\":{},\"intensity\":{},\"local_tone\":{},\"local_structure\":{},\"skin_structure\":{},\"auto_mask\":{}",
 				constantsFrameIndex, static_cast<uint32_t>(*a_frameToken), lowResExtent.width, lowResExtent.height,
 				fullExtent.width, fullExtent.height, constantsJitter.x, constantsJitter.y,
-				lastTemporalResetFrameIndex == constantsFrameIndex, !(featureDLSSNR && slDLSSNRSetOptions),
+				lastTemporalResetFrameIndex == constantsFrameIndex, a_nrAfterSR || !(featureDLSSNR && slDLSSNRSetOptions),
 				a_dlssNRPassCount, a_qualityMode, a_dlssNROptions.style, a_dlssNROptions.intensity,
 				a_dlssNROptions.localToneStrength, a_dlssNROptions.localStructureStrength,
 				a_dlssNROptions.skinStructureStrength, a_dlssNROptions.useAutoMask == sl::Boolean::eTrue));
@@ -1601,15 +1582,71 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		NRDiagnosticCapture::Copy(a_commandList, "input", a_color, lowResExtent.width, lowResExtent.height);
 		NRDiagnosticCapture::Copy(a_commandList, "mv", a_motionVectors, lowResExtent.width, lowResExtent.height);
 		NRDiagnosticCapture::Copy(a_commandList, "depth", a_depth, lowResExtent.width, lowResExtent.height);
-		if (!(featureDLSSNR && slDLSSNRSetOptions) && a_nrMotionVectors) {
-			NRDiagnosticCapture::Copy(a_commandList, "nr_mv", a_nrMotionVectors, lowResExtent.width, lowResExtent.height);
+		if ((a_nrAfterSR || !(featureDLSSNR && slDLSSNRSetOptions)) && a_nrMotionVectors) {
+			NRDiagnosticCapture::Copy(a_commandList, "nr_mv", a_nrMotionVectors, nrExtent.width, nrExtent.height);
+			if (a_nrAfterSR && a_nrDepth) {
+				NRDiagnosticCapture::Copy(a_commandList, "nr_depth", a_nrDepth, nrExtent.width, nrExtent.height);
+			}
 			NRDiagnosticCapture::Annotate(a_commandList,
-				std::format("\"nr_mv_encoding\":\"pixels_with_jitter\",\"nr_jitter_delta\":[{},{}]", a_nrJitterDelta.x, a_nrJitterDelta.y));
+				std::format("\"nr_position\":\"{}\",\"nr_mv_encoding\":\"{}\",\"nr_jitter_delta\":[{},{}]",
+					a_nrAfterSR ? "after_sr" : "before_sr",
+					a_nrAfterSR ? "display_pixels_without_jitter" : "pixels_with_jitter", a_nrJitterDelta.x, a_nrJitterDelta.y));
+			NRDiagnosticCapture::Annotate(a_commandList,
+				std::format("\"nr_guide_extent\":[{},{}],\"nr_guide_sample_offset\":[{},{}],\"nr_guide_sampling\":\"point\"",
+					nrExtent.width, nrExtent.height,
+					a_nrAfterSR ? constantsJitter.x : 0.0f, a_nrAfterSR ? constantsJitter.y : 0.0f));
 		}
 	}
 #endif
 	// The jitter delta is capture metadata; NR consumes the corrected texture.
 	(void)a_nrJitterDelta;
+	if (a_nrAfterSR) {
+		// SR always sees original color in this mode, including NR failure.
+		if (srInputHistoryValid && srInputNRPassCount != 0) { RequestTemporalReset(); }
+		if (!evaluate(false, a_color, a_outputColor, lowResExtent, fullExtent)) {
+#ifdef UPSCALING_NR_CAPTURE
+			if (capture) { NRDiagnosticCapture::Finish(a_commandList, false, false, 0); }
+#endif
+			srInputHistoryValid = false;
+			RequestTemporalReset();
+			return false;
+		}
+#ifdef UPSCALING_NR_CAPTURE
+		if (capture) { NRDiagnosticCapture::Copy(a_commandList, "sr", a_outputColor, fullExtent.width, fullExtent.height); }
+#endif
+		srInputHistoryValid = true;
+		srInputNRPassCount = 0;
+		if (dlssNRRequested && a_sharpenedOutput) {
+			auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(a_outputColor);
+			a_commandList->ResourceBarrier(1, &barrier);
+			if (evaluateDLSSNR()) {
+#ifdef UPSCALING_NR_CAPTURE
+				if (capture) {
+					NRDiagnosticCapture::Copy(a_commandList, "nr", a_sharpenedOutput, fullExtent.width, fullExtent.height);
+					NRDiagnosticCapture::Finish(a_commandList, true, true, directDLSSNR.GetLastEvaluatedPassCount());
+				}
+#endif
+				loggedDLSSNRFallback = false;
+				if (a_sharpened) { *a_sharpened = true; }
+				return true;
+			}
+			if (!loggedDLSSNRFallback) {
+				logger::warn("[Streamline] After-SR DLSS-NR failed; preserving SR output");
+			}
+			loggedDLSSNRFallback = true;
+			directDLSSNR.RequestReset();
+		}
+#ifdef UPSCALING_NR_CAPTURE
+		if (capture) { NRDiagnosticCapture::Finish(a_commandList, false, true, 0); }
+#endif
+		// Same sharpening fallback as Before SR. Failed NR output is never used.
+		if (a_sharpness > 0.0f && a_sharpenedOutput &&
+			ApplyNISSharpenD3D12(a_outputColor, a_sharpenedOutput, a_commandList, a_frameToken, a_displaySize, a_sharpness)) {
+			if (a_sharpened) { *a_sharpened = true; }
+		}
+		return true;
+	}
+
 	bool neuralRendered = false;
 	uint32_t evaluatedNRPassCount = 0;
 	if (dlssNRRequested && a_sharpenedOutput) {
@@ -1808,22 +1845,17 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const
 {
 	const auto* upscaling = Upscaling::GetSingleton();
-	if (dlssNRSuspended || (featureDLSSNR && slDLSSNRSetOptions) ||
-		!upscaling->settings.dlssNREnabled || a_slot >= upscaling->dlssD3D12InputsReady.size() ||
+	if (a_slot >= upscaling->dlssD3D12InputsReady.size() || dlssNRSuspended ||
+		(!upscaling->nrAfterSR[a_slot] && featureDLSSNR && slDLSSNRSetOptions) ||
+		!upscaling->IsDLSSNRReady() ||
 		!upscaling->dlssD3D12InputsReady[a_slot] || !upscaling->dlssSharpenedD3D12[a_slot]) {
 		return false;
 	}
-	const auto size = upscaling->dlssgInputRenderSizes[a_slot];
+	const auto size = upscaling->nrAfterSR[a_slot] ? upscaling->dlssgInputDisplaySizes[a_slot] : upscaling->dlssgInputRenderSizes[a_slot];
 	a_parameters = {};
 	a_parameters.inputWidth = a_parameters.outputWidth = a_parameters.guideWidth = static_cast<uint32_t>(size.x);
 	a_parameters.inputHeight = a_parameters.outputHeight = a_parameters.guideHeight = static_cast<uint32_t>(size.y);
-	const auto quality = ENBRenderDomain::Get().Active() ? ENBRenderDomain::Get().Quality() : upscaling->settings.qualityMode;
-	// Same NGX mapping as DLSSNRPerformanceMode: DLAA, Quality, Balanced,
-	// Performance, Ultra Performance. The explicit NR mode takes precedence.
-	constexpr uint32_t modes[]{ 6, 3, 2, 1, 4 };
-	const auto requested = upscaling->settings.dlssNRPerformanceMode;
-	a_parameters.options.performanceMode = requested == 0 ? modes[quality < std::size(modes) ? quality : 0] :
-		requested == 5 ? 6 : requested;
+	a_parameters.options.performanceMode = nvngx::dlss_nr::kNativePerformanceMode;
 	a_parameters.options.preset = upscaling->settings.dlssNRPreset;
 	a_parameters.options.style = upscaling->settings.dlssNRStyle;
 	a_parameters.options.intensity = upscaling->settings.dlssNRIntensity;
@@ -1866,13 +1898,13 @@ void Streamline::DisableDLSS()
 	}
 }
 
-void Streamline::DestroyDLSSResources()
+void Streamline::DestroyDLSSResources(bool a_preserveDirectNR)
 {
 	RequestTemporalReset();
 	srInputHistoryValid = false;
 	srInputNRPassCount = 0;
 	DisableDLSS();
-	directDLSSNR.ReleaseFeature();
+	if (!a_preserveDirectNR) { directDLSSNR.ReleaseFeature(); }
 
 	if (!initialized || !slFreeResources) {
 		return;

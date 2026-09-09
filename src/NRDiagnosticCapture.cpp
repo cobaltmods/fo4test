@@ -116,10 +116,11 @@ namespace NRDiagnosticCapture
 					"Each JSON describes the accompanying raw little-endian .bin images.\n"
 					"Rows are tightly packed (row_bytes), top-left origin, no D3D12 pitch padding.\n"
 					"DXGI formats: 28=RGBA8 UNORM; 34=RG16 FLOAT (motion); 41=R32 FLOAT (depth).\n"
-					"Optional nr_mv: format 34=RG16 FLOAT, NR-only pixel motion including jitter delta.\n"
+					"Optional nr_mv: format 34=RG16 FLOAT, NR-only pixel motion; jitter delta applies only before SR.\n"
 					"Other formats retain their original DXGI numeric format; no gamma or range conversion.\n"
-					"input/NR are render-size crops, SR is display-size before NIS and UI.\n"
+					"input is render-size; SR is display-size before NIS/UI. NR extent follows nr_position (before_sr/after_sr).\n"
 					"jitter is the published Streamline jitter in pixels. MV pixels are unmodified engine values.\n"
+					"nr_mv/nr_depth are NR guides; nr_guide_sample_offset is applied when reading the raw raster guides.\n"
 					"nr_pass_N contains actual direct-NGX reset and scale parameters, not inferred values.\n"
 					"Missing frames or complete=false indicate an incomplete capture; retain the plugin log.\n";
 			}

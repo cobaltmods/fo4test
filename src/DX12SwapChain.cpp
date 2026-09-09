@@ -847,8 +847,6 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
-	nativeUISharedTexture = nullptr;
-	nativeUIReadFenceValue = 0;
 	menuComposite = nullptr;
 	sceneUISRV = nullptr;
 	interopReady = false;
@@ -978,8 +976,12 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 		return result;
 	}
 
-	Upscaling::GetSingleton()->DestroyUpscalingResources();
-	Streamline::GetSingleton()->DestroyDLSSResources();
+	// After NR owns display-sized guides and a fixed-size network. A scene
+	// quality change invalidates its history, not its allocations or feature.
+	const bool preserveNativeNR = Upscaling::GetSingleton()->settings.dlssNRPosition == 1;
+	Upscaling::GetSingleton()->DestroyUpscalingResources(preserveNativeNR, true);
+	Streamline::GetSingleton()->DestroyDLSSResources(preserveNativeNR);
+	logger::info("[DLSS-NR] Scene quality change: preserve-native-resources={}", preserveNativeNR);
 	presentOverrideFinalColor = nullptr;
 	for (auto& command : commandContexts) { command.retainedPresentOverride = nullptr; }
 	NativeInterfaceUI::ReleaseResources();
@@ -1737,6 +1739,9 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	d3d11Context->CopyResource(staging->resource11.get(), uiTarget);
 	const auto inputFence = fenceValue++;
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
+	// There is no real D3D11 Present to submit this context for us. Submit
+	// the UI copy and its signal before the D3D12 queue consumes the snapshot.
+	d3d11Context->Flush();
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
 	command.retainedPresentOverride = presentOverrideFinalColor;
 	auto* scene = command.retainedPresentOverride.get();
@@ -1778,14 +1783,13 @@ bool DX12SwapChain::BeginNativeUI()
 			desc.Height = swapChainDesc.Height;
 			desc.MiscFlags = 0;
 			desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			auto shared = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
-			auto texture = shared->resource11;
+			winrt::com_ptr<ID3D11Texture2D> texture;
+			DX::ThrowIfFailed(d3d11Device->CreateTexture2D(&desc, nullptr, texture.put()));
 			auto ui = std::make_unique<Texture2D>(texture.detach());
 			DX::ThrowIfFailed(d3d11Device->CreateRenderTargetView(ui->resource.get(), nullptr, ui->rtv.put()));
 			DX::ThrowIfFailed(d3d11Device->CreateShaderResourceView(ui->resource.get(), nullptr, ui->srv.put()));
 			DX::ThrowIfFailed(d3d11Device->CreateUnorderedAccessView(ui->resource.get(), nullptr, ui->uav.put()));
 			nativeUITexture = std::move(ui);
-			nativeUISharedTexture = std::move(shared);
 			++nativeUIGeneration;
 			logger::info("[ENB UI] Native screen-space target {}x{}; scene {}x{}, generation={}",
 				desc.Width, desc.Height, ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height(), nativeUIGeneration);
@@ -1801,10 +1805,10 @@ SamplerState LinearClamp : register(s0);
 [numthreads(8, 8, 1)]
 void main(uint3 p : SV_DispatchThreadID)
 {
-    uint width, height;
-    Output.GetDimensions(width, height);
-    if (p.x >= width || p.y >= height) return;
-    Output[p.xy] = Input.SampleLevel(LinearClamp, (float2(p.xy) + 0.5) / float2(width, height), 0);
+	uint width, height;
+	Output.GetDimensions(width, height);
+	if (p.x >= width || p.y >= height) return;
+	Output[p.xy] = Input.SampleLevel(LinearClamp, (float2(p.xy) + 0.5) / float2(width, height), 0);
 })";
 			winrt::com_ptr<ID3DBlob> shader, errors;
 			DX::ThrowIfFailed(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), errors.put()));
@@ -1817,13 +1821,9 @@ void main(uint3 p : SV_DispatchThreadID)
 			sampler.MaxLOD = D3D11_FLOAT32_MAX;
 			DX::ThrowIfFailed(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()));
 		}
-		// Keep the UI allocation stable for Scaleform/ENB caches. Only its next
-		// write waits for the previous D3D12 read; earlier world work can proceed.
-		// This fence is signaled exclusively by D3D12, unlike the interop fence.
-		if (nativeUIReadFenceValue != 0) {
-			DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), nativeUIReadFenceValue));
-			nativeUIReadFenceValue = 0;
-		}
+		// Keep the UI allocation stable for Scaleform/ENB caches. D3D12 reads
+		// a per-command-context snapshot at Present, so the next UI write does
+		// not need to wait for the previous frame's D3D12 composition.
 		// A separate D3D12 scene requires a transparent overlay, including when
 		// menu rendering leaves an old world image in the D3D11 backbuffer.
 		if (presentOverrideFinalColor) {
@@ -1950,8 +1950,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	const auto dlssgPresentSafety = streamline->NeedsDLSSGPresentSafety();
 	// Keep at most the existing number of swapchain slots in flight. Moving
 	// input reuse to the GPU must not create an unbounded CPU submission queue.
-	if (!WaitForCommandFence(presentSlotFenceValues[frameIndex])) {
-		return DXGI_ERROR_DEVICE_REMOVED;
+	{
+		if (!WaitForCommandFence(presentSlotFenceValues[frameIndex])) {
+			return DXGI_ERROR_DEVICE_REMOVED;
+		}
 	}
 
 	auto& commandContext = AcquireCommandContext();
@@ -1961,17 +1963,22 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
-	const bool useSharedNativeUI = ENBRenderDomain::Get().Active();
-	if (useSharedNativeUI) {
+	if (ENBRenderDomain::Get().Active()) {
 		if (!BeginNativeUI()) {
 			return E_FAIL;
 		}
+		// AcquireCommandContext has completed the prior D3D12 use of this
+		// snapshot. Copy on D3D11 before signaling this frame's UI-ready fence.
+		d3d11Context->CopyResource(presentStaging->resource11.get(), nativeUITexture->resource.get());
 	} else if (swapChainBufferProxyENB) {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxyENB->resource11.get());
 	} else {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxy->resource.get());
 	}
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	// Publish the complete D3D11 UI batch before the consumer queue waits.
+	// Flush submits work; it does not wait for GPU completion on the CPU.
+	d3d11Context->Flush();
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
 
@@ -1994,7 +2001,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	upscaling->dlssDepthCaptureFrames[presentedFrameIndex] = 0;
 	upscaling->fsrDepthCaptureFrames[presentedFrameIndex] = 0;
 	upscaling->reshadeDepthCaptureFrames[presentedFrameIndex] = 0;
-	auto copySource = useSharedNativeUI ? nativeUISharedTexture->resource12.get() : presentStaging->resource12.get();
+	auto copySource = presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
 	// Retain its resource through submission, but do not composite it a second time.
@@ -2096,11 +2103,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		reshadeSnapshotFrames[presentedFrameIndex] = depthFrame;
 		ReShadeDepth::PublishSubmittedDepth();
 	}
-	if (useSharedNativeUI) {
-		// The compositor is the last D3D12 reader of this UI texture. FG receives
-		// the composed swapchain image and separate world/depth/motion resources.
-		nativeUIReadFenceValue = commandContext.fenceValue;
-	}
 
 	const auto vsyncMode = upscaling->settings.vsyncMode;
 	UINT presentSyncInterval = vsyncMode == 2 ? 1u : vsyncMode == 1 ? 0u : SyncInterval;
@@ -2148,6 +2150,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 		streamline->OnDLSSGPresentComplete();
 		upscaling->AdvanceDeferredResourceReleases();
+		if (result == S_OK) {
+			upscaling->OnNRPresentComplete(presentedFrameIndex);
+		}
 	}
 	if (FAILED(result)) {
 		const auto d3d12RemovedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : S_OK;
@@ -2240,11 +2245,17 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		// Even an unsuccessful NGX creation may record GPU work. Submit and
 		// fence it rather than resetting/releasing an apparently idle context.
 		ExecuteCommandContext(initialization);
+		// Feature creation itself changes the NR working set. Present one
+		// SR-only frame after that submission before evaluating the new feature.
+		Upscaling::GetSingleton()->DeferNRUntilPresent(false);
 		logger::info("[DLSS-NR Direct] Preparation submitted ready={} input={}x{} mode={} passes={} fence={}",
 			prepared, nrPreparation.inputWidth, nrPreparation.inputHeight,
 			nrPreparation.options.performanceMode, nrPreparation.passCount, initialization.fenceValue);
 	}
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	// Submit scene/guide copies now, independently of later UI rendering or
+	// Present. Otherwise D3D12 depends on the D3D11 runtime's automatic flush.
+	d3d11Context->Flush();
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
 

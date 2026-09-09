@@ -203,8 +203,6 @@ private:
 	uint32_t pendingSceneQuality = 0;
 	uint64_t enbSceneResizeGeneration = 0;
 	std::unique_ptr<Texture2D> nativeUITexture;
-	std::unique_ptr<D3D11D3D12SharedTexture> nativeUISharedTexture;
-	UINT64 nativeUIReadFenceValue = 0;
 	winrt::com_ptr<ID3D11ShaderResourceView> sceneUISRV;
 	winrt::com_ptr<ID3D11ComputeShader> nativeUIResolve;
 	winrt::com_ptr<ID3D11SamplerState> nativeUISampler;
