@@ -312,14 +312,8 @@ public:
 	void PreFrameGenerationAlpha();
 	bool PostFrameGenerationAlpha();
 	void CopyFrameGenerationBuffers();
-	void CaptureReShadeDepth();
-	ID3D12Resource* GetCurrentSharedDepth() const;
-	uint64_t reshadeSceneDepthFrame = 0;
 	std::array<uint64_t, kDX12FrameCount> dlssDepthCaptureFrames{};
 	std::array<uint64_t, kDX12FrameCount> fsrDepthCaptureFrames{};
-	std::array<uint64_t, kDX12FrameCount> reshadeDepthCaptureFrames{};
-	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> reshadeDepthSharedTextures;
-	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> reshadeDepthD3D12;
 
 	ID3D11ShaderResourceView* originalDepthView;	    ///< Original depth buffer SRV
 	std::unique_ptr<Texture2D> depthOverrideTexture;    ///< Dynamic resolution depth override texture

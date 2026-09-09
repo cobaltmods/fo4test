@@ -19,7 +19,7 @@
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
-#include "ReShadeDepth.h"
+#include "SceneReShade.h"
 
 extern bool enbLoaded;
 
@@ -1233,12 +1233,6 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 	static void thunk(RE::BSGraphics::RenderTargetManager* This, uint a2, uint a3, uint a4, uint a5)
 	{
 		auto upscaling = Upscaling::GetSingleton();
-		// Capture after all return paths have restored the original depth SRV,
-		// and before native UI can clear or replace the scene depth.
-		struct CaptureDepthOnExit
-		{
-			~CaptureDepthOnExit() { Upscaling::GetSingleton()->CaptureReShadeDepth(); }
-		} captureDepthOnExit;
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		static auto gameViewport = Util::State_GetSingleton();
@@ -1370,7 +1364,6 @@ struct DrawWorld_FrameGenerationForward
 	static void thunk(void* This)
 	{
 		func(This);
-		Upscaling::GetSingleton()->reshadeSceneDepthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
 
 		if (!frameGenerationFirstPersonAlphaFix) {
 			Upscaling::GetSingleton()->CopyFrameGenerationBuffers();
@@ -1834,6 +1827,7 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	if (currentUpscaleMethodPreference == UpscaleMethod::kDisabled) SceneReShade::Reset();
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
@@ -3626,6 +3620,15 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		renderSize = { static_cast<float>(ENBRenderDomain::Get().Width()), static_cast<float>(ENBRenderDomain::Get().Height()) };
 		displaySize = { static_cast<float>(display.Width), static_cast<float>(display.Height) };
 	}
+	{
+		DXGI_SWAP_CHAIN_DESC desc{};
+		auto* swap = reinterpret_cast<IDXGISwapChain*>(rendererData->renderWindow[0].swapChain);
+		if (swap && SUCCEEDED(swap->GetDesc(&desc))) {
+			auto* depth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+			SceneReShade::Render(static_cast<ID3D11Texture2D*>(frameBufferResource), depth, desc.OutputWindow,
+				static_cast<UINT>(renderSize.x), static_cast<UINT>(renderSize.y));
+		}
+	}
 	osdRenderSize = renderSize;
 	osdNativeSize = displaySize;
 
@@ -4013,113 +4016,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			const float transparent[4]{};
 			context->ClearRenderTargetView(rtv, transparent);
 		}
-	}
-}
-
-ID3D12Resource* Upscaling::GetCurrentSharedDepth() const
-{
-	const auto slot = DX12SwapChain::GetSingleton()->GetFrameIndex();
-	if (slot >= kDX12FrameCount) {
-		return nullptr;
-	}
-	const auto frame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
-	if (dlssDepthCaptureFrames[slot] == frame && dlssgDepthD3D12[slot]) {
-		return dlssgDepthD3D12[slot].get();
-	}
-	if (fsrDepthCaptureFrames[slot] == frame && fsrDepthD3D12[slot]) {
-		return fsrDepthD3D12[slot].get();
-	}
-	return reshadeDepthCaptureFrames[slot] == frame ? reshadeDepthD3D12[slot].get() : nullptr;
-}
-
-void Upscaling::CaptureReShadeDepth()
-{
-	auto* swap = DX12SwapChain::GetSingleton();
-	if (!ReShadeDepth::IsRequested() || !swap->IsReady() || swap->IsWindowUnavailable() || GetCurrentSharedDepth()) {
-		return;
-	}
-	const auto slot = swap->GetFrameIndex();
-	if (slot >= kDX12FrameCount) {
-		return;
-	}
-	reshadeDepthCaptureFrames[slot] = 0;
-	if (reshadeSceneDepthFrame != static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1) {
-		return;  // A restored/frozen background is not a new world-depth render.
-	}
-	try {
-		auto* data = RE::BSGraphics::GetRendererData();
-		auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(data->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
-		if (!srv) {
-			return;
-		}
-		winrt::com_ptr<ID3D11Resource> resource;
-		srv->GetResource(resource.put());
-		auto texture = resource.try_as<ID3D11Texture2D>();
-		if (!texture) {
-			return;
-		}
-		D3D11_TEXTURE2D_DESC desc{};
-		texture->GetDesc(&desc);
-		if (desc.SampleDesc.Count != 1) {
-			return;
-		}
-		if (ENBRenderDomain::Get().Active()) {
-			desc.Width = std::min(desc.Width, ENBRenderDomain::Get().Width());
-			desc.Height = std::min(desc.Height, ENBRenderDomain::Get().Height());
-		} else {
-			const auto* state = Util::State_GetSingleton();
-			const auto ratios = GetDynamicResolutionRatios();
-			desc.Width = std::min(desc.Width, std::max(1u, static_cast<UINT>(state->screenWidth * ratios.width)));
-			desc.Height = std::min(desc.Height, std::max(1u, static_cast<UINT>(state->screenHeight * ratios.height)));
-		}
-		desc.Format = DXGI_FORMAT_R32_FLOAT;
-		desc.MipLevels = 1;
-		desc.ArraySize = 1;
-		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		desc.MiscFlags = 0;
-		auto* shader = GetCopyDepthToFrameGenerationCS();
-		if (!shader || !swap->WaitForFrameSlot(slot, true)) {
-			return;
-		}
-		EnsureSharedD3D12Texture(this, desc, reshadeDepthSharedTextures[slot], reshadeDepthD3D12[slot], true);
-		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
-		// Preserve the exact state touched by this optional fallback dispatch.
-		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-		winrt::com_ptr<ID3D11DepthStencilView> dsv;
-		context->OMGetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.put());
-		winrt::com_ptr<ID3D11ComputeShader> oldShader;
-		ID3D11ClassInstance* instances[256]{};
-		UINT instanceCount = static_cast<UINT>(std::size(instances));
-		context->CSGetShader(oldShader.put(), instances, &instanceCount);
-		winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
-		winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
-		context->CSGetShaderResources(0, 1, oldSRV.put());
-		context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
-		context->OMSetRenderTargets(0, nullptr, nullptr);
-		context->CSSetShaderResources(0, 1, &srv);
-		auto* uav = reshadeDepthSharedTextures[slot]->uav.get();
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-		context->CSSetShader(shader, nullptr, 0);
-		context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
-		ID3D11ShaderResourceView* nullSRV = nullptr;
-		ID3D11UnorderedAccessView* nullUAV = nullptr;
-		context->CSSetShaderResources(0, 1, &nullSRV);
-		context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-		auto* restoreSRV = oldSRV.get();
-		auto* restoreUAV = oldUAV.get();
-		context->CSSetShaderResources(0, 1, &restoreSRV);
-		context->CSSetUnorderedAccessViews(0, 1, &restoreUAV, nullptr);
-		context->CSSetShader(oldShader.get(), instances, instanceCount);
-		context->OMSetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.get());
-		for (auto* rtv : rtvs) {
-			if (rtv) rtv->Release();
-		}
-		for (UINT i = 0; i < instanceCount; ++i) {
-			if (instances[i]) instances[i]->Release();
-		}
-		reshadeDepthCaptureFrames[slot] = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
-	} catch (const std::exception& e) {
-		logger::error("[ReShade depth] Fallback capture failed: {}", e.what());
 	}
 }
 
@@ -5273,11 +5169,6 @@ void Upscaling::DestroyUpscalingResources(bool a_preserveNativeNR, bool a_intero
 	nrMotionReady.fill(false);
 	nrMotionHistoryValid = false;
 	fsrDepthCaptureFrames.fill(0);
-	reshadeDepthCaptureFrames.fill(0);
-	reshadeSceneDepthFrame = 0;
-	for (std::size_t i = 0; i < kDX12FrameCount; ++i) {
-		RetireSharedD3D12Texture(reshadeDepthSharedTextures[i], reshadeDepthD3D12[i]);
-	}
 	RetireD3D11Texture(upscalingTexture);
 	RetireD3D11Texture(dlssOutputTexture);
 	RetireD3D11Texture(spatialFallbackTexture);
