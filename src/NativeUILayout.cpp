@@ -20,12 +20,14 @@ namespace
 		uint32_t DisplacementOffset() const { return extendedRegister ? 3u : 2u; }
 		uint32_t InstructionSize() const { return DisplacementOffset() + sizeof(int32_t); }
 	};
-	std::array<ReadPatch, 8> patches{};
+	std::array<ReadPatch, 14> patches{};
 	size_t patchCount = 0;
 	uint32_t* displaySize = nullptr;
 	bool installed = false;
 	bool edgesInstalled = false;
+	bool looksInstalled = false;
 	size_t layoutPatchCount = 0;
+	size_t edgePatchEnd = 0;
 	bool InstallRange(size_t begin, size_t end);
 
 	bool Install()
@@ -51,9 +53,25 @@ namespace
 		patches[patchCount++] = { dialogue + (og ? 0xE4 : 0xE3), true, 0x0D, true, true };  // mov r9d
 		patches[patchCount++] = { multiActivate + 0x19, false, 0x15, false, true };  // mov edx
 		patches[patchCount++] = { multiActivate + (og ? 0x99 : 0x98), true, 0x0D, true, true };  // mov r9d
-		// A rejected edge patch must not disable the existing native movie layout.
+		edgePatchEnd = patchCount;
+		// Keep initialization, cursor clamp/normalization and the queued ray in
+		// one display-pixel domain. AE MoveSculptCursor has an extra widescreen
+		// argument; patch only its reads so that calculation remains intact.
+		// Read sites verified in OG 1.10.163 and AE 1.11.191 / 1.11.221.
+		const auto looksCtor = REL::ID{ 201900, 2223341 }.address();
+		const auto looksMove = REL::ID{ 187054, 2223363 }.address();
+		const auto looksPick = REL::ID{ 116364, 2223353 }.address();
+		patches[patchCount++] = { looksCtor + (og ? 0x5FB : 0x819), false };
+		patches[patchCount++] = { looksCtor + (og ? 0x639 : 0x852), true };
+		patches[patchCount++] = { looksMove + (og ? 0x12 : 0x31), false };
+		patches[patchCount++] = { looksMove + (og ? 0x6D : 0x79), true };
+		patches[patchCount++] = { looksPick + 0x6, true };
+		patches[patchCount++] = { looksPick + (og ? 0x3B : 0x38), false };
+		// Validate/commit all six LooksMenu reads together. A rejected group
+		// must not disable the existing movie or edge patches.
 		const bool layoutInstalled = InstallRange(0, layoutPatchCount);
-		edgesInstalled = InstallRange(layoutPatchCount, patchCount);
+		edgesInstalled = InstallRange(layoutPatchCount, edgePatchEnd);
+		looksInstalled = InstallRange(edgePatchEnd, patchCount);
 		return layoutInstalled;
 	}
 
@@ -117,19 +135,19 @@ void NativeUILayout::SetDisplaySize(uint32_t a_width, uint32_t a_height)
 	}
 	::InterlockedExchange(reinterpret_cast<volatile LONG*>(displaySize), static_cast<LONG>(a_width));
 	::InterlockedExchange(reinterpret_cast<volatile LONG*>(displaySize + 1), static_cast<LONG>(a_height));
-	if (!installed && !edgesInstalled) {
+	if (!installed && !edgesInstalled && !looksInstalled) {
 		installed = Install();
 	}
-	logger::info("[ENB UI layout] Stable display size {}x{}; Movie/crosshair reads patched={}; menu edge reads patched={}", a_width, a_height, installed, edgesInstalled);
+	logger::info("[ENB UI layout] Stable display size {}x{}; Movie/crosshair reads patched={}; menu edge reads patched={}; LooksMenu reads patched={}", a_width, a_height, installed, edgesInstalled, looksInstalled);
 }
 
 void NativeUILayout::Restore()
 {
-	if (!installed && !edgesInstalled) {
+	if (!installed && !edgesInstalled && !looksInstalled) {
 		return;
 	}
 	for (size_t i = 0; i < patchCount; ++i) {
-		if (i < layoutPatchCount ? !installed : !edgesInstalled) {
+		if (i < layoutPatchCount ? !installed : (i < edgePatchEnd ? !edgesInstalled : !looksInstalled)) {
 			continue;
 		}
 		const auto& patch = patches[i];
@@ -142,4 +160,5 @@ void NativeUILayout::Restore()
 	}
 	installed = false;
 	edgesInstalled = false;
+	looksInstalled = false;
 }
