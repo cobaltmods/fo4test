@@ -1,9 +1,11 @@
 #include "NativeInterfaceUI.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <intrin.h>
 #include <utility>
 
@@ -866,6 +868,48 @@ void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 	}
 }
 
+namespace
+{
+	// The Pip-Boy cursor viewport rect is a raw .rdata constant with no stable
+	// address-library id across runtimes, so locate it structurally instead of by
+	// id: the cursor movie's root-path literal sits immediately before it, and the
+	// rect itself is the unique { 0, 0, 1920, 1080 } quad that follows. Verified on
+	// 1.10.984 at .rdata 0x23A9E40, directly after "root1.Cursor_mc" at 0x23A9E30.
+	std::int32_t* FindPipboyCursorViewportRect()
+	{
+		static constexpr char kCursorRoot[]{ "root1.Cursor_mc" };
+		static constexpr std::int32_t kStockRect[]{ 0, 0, 1920, 1080 };
+		const auto* base = reinterpret_cast<const std::uint8_t*>(::GetModuleHandleW(nullptr));
+		if (!base) {
+			return nullptr;
+		}
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		const auto* section = IMAGE_FIRST_SECTION(nt);
+		for (std::uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+			if (std::memcmp(section->Name, ".rdata", 6) != 0) {
+				continue;
+			}
+			const auto* begin = base + section->VirtualAddress;
+			const auto* end = begin + section->Misc.VirtualSize;
+			for (const auto* at = begin;;) {
+				at = std::search(at, end, std::begin(kCursorRoot), std::end(kCursorRoot));
+				if (at == end) {
+					break;
+				}
+				const auto* probe = at + sizeof(kCursorRoot);
+				for (; probe + sizeof(kStockRect) <= end && probe < at + 0x40; probe += sizeof(std::int32_t)) {
+					if (std::memcmp(probe, kStockRect, sizeof(kStockRect)) == 0) {
+						return const_cast<std::int32_t*>(reinterpret_cast<const std::int32_t*>(probe));
+					}
+				}
+				at += sizeof(kCursorRoot);
+			}
+		}
+		return nullptr;
+	}
+}
+
 void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
 {
 	// PromotePipboyExtent grows only the PHYSICAL Pip-Boy colour/depth allocation to
@@ -888,10 +932,11 @@ void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
 	if (scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
 		return;
 	}
-	// The cursor rect is a raw .rdata constant, so it needs a per-runtime id and only
-	// the NG (1.10.984) one is known. Apply the whole scaling together or not at all:
-	// scaling the settings without the rect would merely move the clip, not remove it.
-	if (!REX::FModule::IsRuntimeNG()) {
+	// All or nothing: scaling the buffer without the rect would move the clip rather
+	// than remove it, so bail out entirely if the rect cannot be located.
+	auto* cursorRect = FindPipboyCursorViewportRect();
+	if (!cursorRect) {
+		logger::warn("[ENB UI] Pip-Boy cursor viewport rect not found; leaving the Pip-Boy logical space unscaled");
 		return;
 	}
 	auto* targetWidth = RE::GetINISetting("uPipboyTargetWidth:Display");
@@ -930,12 +975,11 @@ void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
 		}
 	}
 
-	// { left, top, width, height } int32s; only the extent grows, the origin stays 0,0.
-	const REL::Relocation<std::int32_t*> cursorRect{ REL::ID{ 2359406 } };
+	// { left, top, width, height }; only the extent grows, the origin stays 0,0.
 	const auto rectWidth = static_cast<std::int32_t>(scaleValue(1920));
 	const auto rectHeight = static_cast<std::int32_t>(scaleValue(1080));
-	REL::WriteSafeData(cursorRect.address() + 0x8, rectWidth);
-	REL::WriteSafeData(cursorRect.address() + 0xC, rectHeight);
+	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 2), rectWidth);
+	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 3), rectHeight);
 
 	scaled = true;
 	logger::info("[ENB UI] Scaled Pip-Boy logical space x{:.4f}: target {}x{} -> {}x{}, cursor rect 1920x1080 -> {}x{}",
