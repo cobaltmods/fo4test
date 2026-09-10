@@ -1,6 +1,7 @@
 #include "NativeInterfaceUI.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <intrin.h>
@@ -863,4 +864,81 @@ void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 	if (!enabled) {
 		logger::error("[ENB UI] Incomplete Interface3D hooks; native custom path disabled");
 	}
+}
+
+void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
+{
+	// PromotePipboyExtent grows only the PHYSICAL Pip-Boy colour/depth allocation to
+	// the display height. Three LOGICAL quantities describe that same surface, and if
+	// they do not follow the identical growth they end up describing a small top-left
+	// corner of it:
+	//   * uPipboyTarget{Width,Height} - the offscreen buffer size the engine reports
+	//     through Interface3D::Renderer::Offscreen_GetRenderTarget{Width,Height}.
+	//   * uPipboyConstraint* - where Pip-Boy content is placed inside that buffer.
+	//   * CursorMenu's hard-coded { 0, 0, 1920, 1080 } viewport rect. CursorMenu
+	//     special-cases the "PipboyMenu" renderer and hand-builds its viewport rather
+	//     than going through Interface3D::Renderer::SetViewport like every other
+	//     custom renderer, and Scaleform clips the draw to min(rect, buffer). With a
+	//     promoted target that stranded the mouse cursor sprite inside a
+	//     uPipboyTarget-sized top-left window of the map, and no INI setting can
+	//     reach the 1920x1080 constant.
+	// Scaling all three by one factor leaves the Pip-Boy visually identical while the
+	// cursor both covers and correctly addresses the whole surface.
+	static bool scaled = false;
+	if (scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
+		return;
+	}
+	// The cursor rect is a raw .rdata constant, so it needs a per-runtime id and only
+	// the NG (1.10.984) one is known. Apply the whole scaling together or not at all:
+	// scaling the settings without the rect would merely move the clip, not remove it.
+	if (!REX::FModule::IsRuntimeNG()) {
+		return;
+	}
+	auto* targetWidth = RE::GetINISetting("uPipboyTargetWidth:Display");
+	auto* targetHeight = RE::GetINISetting("uPipboyTargetHeight:Display");
+	if (!targetWidth || !targetHeight) {
+		return;
+	}
+	const auto logicalWidth = targetWidth->GetUInt();
+	const auto logicalHeight = targetHeight->GetUInt();
+	if (!logicalWidth || !logicalHeight || logicalHeight >= a_displayHeight) {
+		return;  // already display-sized: nothing is promoted, so nothing to scale
+	}
+	const auto scale = static_cast<double>(a_displayHeight) / static_cast<double>(logicalHeight);
+	const auto scaleValue = [scale](uint32_t a_value) {
+		return static_cast<uint32_t>(std::lround(static_cast<double>(a_value) * scale));
+	};
+
+	// Matches PromotePipboyExtent's own aspect-preserving growth, so the engine now
+	// allocates the promoted extent directly and the promotion becomes a no-op.
+	targetWidth->SetUInt(scaleValue(logicalWidth));
+	targetHeight->SetUInt(a_displayHeight);
+
+	static constexpr const char* constraints[]{
+		"uPipboyConstraintTLX:Pipboy",
+		"uPipboyConstraintTLY:Pipboy",
+		"uPipboyConstraintWidth:Pipboy",
+		"uPipboyConstraintHeight:Pipboy",
+		"uPipboyConstraintTLX_PowerArmor:Pipboy",
+		"uPipboyConstraintTLY_PowerArmor:Pipboy",
+		"uPipboyConstraintWidth_PowerArmor:Pipboy",
+		"uPipboyConstraintHeight_PowerArmor:Pipboy"
+	};
+	for (const auto* name : constraints) {
+		if (auto* setting = RE::GetINISetting(name)) {
+			setting->SetUInt(scaleValue(setting->GetUInt()));
+		}
+	}
+
+	// { left, top, width, height } int32s; only the extent grows, the origin stays 0,0.
+	const REL::Relocation<std::int32_t*> cursorRect{ REL::ID{ 2359406 } };
+	const auto rectWidth = static_cast<std::int32_t>(scaleValue(1920));
+	const auto rectHeight = static_cast<std::int32_t>(scaleValue(1080));
+	REL::WriteSafeData(cursorRect.address() + 0x8, rectWidth);
+	REL::WriteSafeData(cursorRect.address() + 0xC, rectHeight);
+
+	scaled = true;
+	logger::info("[ENB UI] Scaled Pip-Boy logical space x{:.4f}: target {}x{} -> {}x{}, cursor rect 1920x1080 -> {}x{}",
+		scale, logicalWidth, logicalHeight, targetWidth->GetUInt(), targetHeight->GetUInt(),
+		rectWidth, rectHeight);
 }
