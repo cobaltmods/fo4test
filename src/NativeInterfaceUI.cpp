@@ -180,6 +180,8 @@ namespace
 	{
 		static void thunk(RE::Interface3D::Renderer* a_renderer)
 		{
+			if (a_renderer && a_renderer->postfx.get() == RE::Interface3D::PostEffect::kPipboy) {
+			}
 			if (!AlreadyRendered(a_renderer)) {
 				const auto effect = a_renderer->postfx.get();
 				const bool usesHUDGlass = effect == RE::Interface3D::PostEffect::kHUDGlass ||
